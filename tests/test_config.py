@@ -15,6 +15,22 @@ def write(text: str) -> Path:
     return p
 
 
+class ConfigHardeningTests(unittest.TestCase):
+    def test_paths_stripped_and_validated(self):
+        cfg, _ = b.load_config(write('high_risk_paths = ["  src/auth/**  "]\nowner = "  bob "'))
+        self.assertEqual(cfg.high_risk_paths, ("src/auth/**",))
+        self.assertEqual(cfg.owner, "bob")
+        cfg, _ = b.load_config(write('owner = "   "'))
+        self.assertEqual(cfg.owner, "")
+        for bad in ('[""]', '["  "]', '["src/[ab]/**"]'):
+            with self.assertRaises(b.BelayRefusal) as cm:
+                b.load_config(write(f"high_risk_paths = {bad}"))
+            self.assertEqual(cm.exception.code, 2)
+        with self.assertRaises(b.BelayRefusal) as cm:
+            b.load_config(write('high_risk_paths = ["a[b]"]'))
+        self.assertIn("character classes", cm.exception.reason)
+
+
 class ConfigTests(unittest.TestCase):
     def test_defaults_when_file_missing(self):
         for path in (None, Path(tempfile.mkdtemp()) / "nope.toml"):

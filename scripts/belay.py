@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import posixpath
 import re
 import time
 import tomllib
@@ -104,6 +105,12 @@ def load_config(path: Path | None) -> tuple[Config, list[str]]:
     paths = _typed(data, "high_risk_paths", list, [])
     if not all(isinstance(p, str) for p in paths):
         raise _bad("high_risk_paths must be a list of strings")
+    paths = [p.strip() for p in paths]
+    for p in paths:
+        if not p:
+            raise _bad("high_risk_paths entries must not be empty")
+        if "[" in p:
+            raise _bad(f"high_risk_paths entry {p!r}: character classes ([...]) are not supported")
 
     budget = _section(data, "budget")
     active = _typed(budget, "active_minutes", int, 90, "budget.")
@@ -127,7 +134,7 @@ def load_config(path: Path | None) -> tuple[Config, list[str]]:
         idle_minutes=idle,
         high_risk_paths=tuple(paths),
         test_command=_typed(data, "test_command", str, ""),
-        owner=_typed(data, "owner", str, ""),
+        owner=_typed(data, "owner", str, "").strip(),
         pr_draft=_typed(data, "pr_draft", bool, True),
         labels=labels,
         active_minutes=active,
@@ -424,6 +431,21 @@ def wait(store: RunStore, cfg: Config, run_id: str, reason: str, now: datetime) 
         return run
 
 
+def _check_no_other_working(store: RunStore, cfg: Config, run_id: str, now: datetime) -> None:
+    """Code 5 if another run is `working` with a fresh heartbeat. Call while holding store.lock()."""
+    for other in store.list_runs():
+        if other["run_id"] == run_id or other.get("state") != "working":
+            continue
+        try:
+            age = now - _parse_iso(other["heartbeat"])
+        except (KeyError, TypeError, ValueError):
+            raise BelayRefusal(
+                2, f"corrupt run record {store._path(other['run_id'])}: bad heartbeat") from None
+        if age <= timedelta(minutes=cfg.idle_minutes):
+            raise BelayRefusal(
+                5, f"run {other['run_id']} (issue {other.get('issue')}) is already working")
+
+
 def resume(store: RunStore, cfg: Config, run_id: str, now: datetime) -> dict:
     check_stop(store.root, cfg)
     now = _parse_iso(_iso(now))
@@ -431,17 +453,7 @@ def resume(store: RunStore, cfg: Config, run_id: str, now: datetime) -> dict:
         run = _load_for_update(store, run_id)
         if run.get("state") != "waiting":
             raise BelayRefusal(6, f"cannot resume: run {run_id} is {run.get('state')}, not waiting")
-        for other in store.list_runs():
-            if other["run_id"] == run_id or other.get("state") != "working":
-                continue
-            try:
-                age = now - _parse_iso(other["heartbeat"])
-            except (KeyError, TypeError, ValueError):
-                raise BelayRefusal(
-                    2, f"corrupt run record {store._path(other['run_id'])}: bad heartbeat") from None
-            if age <= timedelta(minutes=cfg.idle_minutes):
-                raise BelayRefusal(
-                    5, f"run {other['run_id']} (issue {other.get('issue')}) is already working")
+        _check_no_other_working(store, cfg, run_id, now)
         _credit(cfg, run, now)  # waiting: moves ticks only, credits nothing
         _transition(run, "working", now, "resumed")
         store.save(run)
@@ -462,6 +474,9 @@ def record_evidence(store: RunStore, run_id: str, *, command: str, exit_code: in
         raise BelayRefusal(2, "evidence exit_code must be an integer")
     if not isinstance(head, str) or not head.strip():
         raise BelayRefusal(2, "evidence head (commit) must be a non-empty string")
+    if not isinstance(stage, str) or not stage.strip():
+        raise BelayRefusal(2, "evidence stage must be a non-empty string")
+    head = head.strip()
     now = _parse_iso(_iso(now))
     with store.lock():
         run = _load_for_update(store, run_id)
@@ -469,7 +484,7 @@ def record_evidence(store: RunStore, run_id: str, *, command: str, exit_code: in
         if not isinstance(ev, list):
             raise BelayRefusal(2, f"corrupt run record {run_id}: evidence is not a list")
         ev.append({"command": command, "exit_code": exit_code, "head": head,
-                   "stage": str(stage), "at": _iso(now)})
+                   "stage": stage, "at": _iso(now)})
         store.save(run)
         return run
 
@@ -481,6 +496,9 @@ def hand_off(store: RunStore, cfg: Config, run_id: str, head: str, now: datetime
     set, its command equals cfg.test_command. So a new commit, or a different command, needs
     fresh evidence (code 7). A run that is not `working` is code 6.
     """
+    if not isinstance(head, str) or not head.strip():
+        raise BelayRefusal(2, "head (commit) must be a non-empty string")
+    head = head.strip()
     now = _parse_iso(_iso(now))
     with store.lock():
         run = _load_for_update(store, run_id)
@@ -504,10 +522,15 @@ def hand_off(store: RunStore, cfg: Config, run_id: str, head: str, now: datetime
 
 
 def _norm_path(p: str) -> str:
-    p = str(p).replace("\\", "/")
-    while p.startswith("./"):
-        p = p[2:]
-    return p
+    """Canonical repo-relative spelling: `/` separators, no drive letter, `//` and `/./` collapsed,
+    `..` resolved, no leading `/` or `./`. Limitation: an absolute path (drive-letter form such as C:/repo/src/x.py) only
+    loses its drive and leading slash; without the repo root its prefix cannot be resolved.
+    A path that climbs above the root keeps a leading `..`.
+    """
+    p = str(p).replace("\\", "/").strip()
+    p = re.sub(r"^[A-Za-z]:", "", p)
+    p = posixpath.normpath(p).lstrip("/") if p else ""
+    return "" if p == "." else p
 
 
 _GLOB_CACHE: dict[str, re.Pattern] = {}
@@ -515,8 +538,8 @@ _GLOB_CACHE: dict[str, re.Pattern] = {}
 
 def _glob_regex(pattern: str) -> re.Pattern:
     pat = _norm_path(pattern)
-    if pat.endswith("/"):
-        pat += "**"
+    if str(pattern).replace("\\", "/").strip().endswith("/") and pat:
+        pat += "/**"
     rx = _GLOB_CACHE.get(pat)
     if rx is not None:
         return rx
@@ -542,7 +565,7 @@ def _glob_regex(pattern: str) -> re.Pattern:
         else:
             out.append(re.escape(c))
             i += 1
-    rx = _GLOB_CACHE[pat] = re.compile("".join(out))
+    rx = _GLOB_CACHE[pat] = re.compile("".join(out), re.IGNORECASE)
     return rx
 
 
@@ -551,8 +574,9 @@ def matches_glob(path: str, pattern: str) -> bool:
 
     `**` spans directories (`**/x` also matches a top-level `x`); `*` and `?` never cross `/`;
     a trailing `/` means the whole directory. Own implementation, not fnmatch (its `*` crosses
-    `/`). Matching is case-SENSITIVE on every platform, so a risky pattern is never silently
-    skipped by case; write patterns in the repo's own case.
+    `/`). Matching is case-INSENSITIVE on every platform: this guards a refusal gate, so it must
+    over-match (e.g. `SRC/Auth/x.py` on a case-insensitive filesystem) rather than under-match.
+    Paths and patterns are normalised by _norm_path (see its limitation for absolute paths).
     """
     if not pattern:
         return False
@@ -561,10 +585,16 @@ def matches_glob(path: str, pattern: str) -> bool:
 
 def check_paths(cfg: Config, changed: Sequence[str], labels: Sequence[str]) -> None:
     """Refuse (code 8) when a changed path matches cfg.high_risk_paths and the issue lacks the approved label."""
+    for name, seq in (("changed", changed), ("labels", labels)):
+        if isinstance(seq, (str, bytes)) or not isinstance(seq, (list, tuple, set, frozenset))                 or not all(isinstance(x, str) for x in seq):
+            raise BelayRefusal(2, f"{name} must be a list of strings, not a bare string")
+    norm = [_norm_path(p) for p in changed]
+    for p in norm:
+        if p == ".." or p.startswith("../"):
+            raise BelayRefusal(2, f"changed path escapes the repo: {p}")
     if cfg.labels["approved"] in labels:
         return
-    hits = [_norm_path(p) for p in changed
-            if any(matches_glob(p, pat) for pat in cfg.high_risk_paths)]
+    hits = [p for p in norm if any(matches_glob(p, pat) for pat in cfg.high_risk_paths)]
     if hits:
         raise BelayRefusal(8, f"high-risk paths changed without label {cfg.labels['approved']!r}: "
                               + ", ".join(hits))
@@ -572,21 +602,32 @@ def check_paths(cfg: Config, changed: Sequence[str], labels: Sequence[str]) -> N
 
 def override(store: RunStore, cfg: Config, run_id: str, *, who: str, kind: str, reason: str,
              minutes: int = 0, now: datetime) -> dict:
-    """Owner-only: `extend` adds budget minutes, `reopen` moves a `failed` run back to `working`."""
-    if not cfg.owner:
+    """Owner-only: `extend` adds budget minutes, `reopen` moves a `failed` run back to `working`.
+
+    Reopen honours the stop switch and the one-working-run rule like resume. It does not reset
+    attempts or budget: a reopened run that is over budget needs a further `extend`.
+    """
+    owner = cfg.owner.strip().casefold() if isinstance(cfg.owner, str) else ""
+    if not owner:
         raise BelayRefusal(9, "no owner configured: set `owner` in .belay.toml to allow overrides")
-    if who != cfg.owner:
+    if not isinstance(who, str) or who.strip().casefold() != owner:
         raise BelayRefusal(9, f"{who!r} is not the owner ({cfg.owner!r}); only the owner may override")
     if kind not in ("extend", "reopen"):
         raise BelayRefusal(2, f"unknown override kind {kind!r}: use extend or reopen")
     if kind == "extend" and (isinstance(minutes, bool) or not isinstance(minutes, int) or minutes <= 0):
         raise BelayRefusal(2, "extend requires minutes > 0")
+    if not isinstance(reason, str) or not reason.strip():
+        raise BelayRefusal(2, "override reason must be a non-empty string")
+    reason = reason.strip()
+    if kind == "reopen":
+        check_stop(store.root, cfg)
     now = _parse_iso(_iso(now))
     with store.lock():
         run = _load_for_update(store, run_id)
         if kind == "reopen":
             if run.get("state") != "failed":
                 raise BelayRefusal(6, f"cannot reopen: run {run_id} is {run.get('state')}, not failed")
+            _check_no_other_working(store, cfg, run_id, now)
             _credit(cfg, run, now)  # failed: moves ticks only, so the downtime is not credited
             _transition(run, "working", now, f"reopened by {who}: {reason}")
         else:

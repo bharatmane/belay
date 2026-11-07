@@ -105,13 +105,40 @@ class GlobTests(unittest.TestCase):
     def test_leading_dot_slash_and_case(self):
         self.assertTrue(b.matches_glob("./src/auth/x.py", "src/auth/**"))
         self.assertTrue(b.matches_glob("src/auth/x.py", "./src/auth/**"))
-        self.assertFalse(b.matches_glob("SRC/auth/x.py", "src/auth/**"))
+        self.assertTrue(b.matches_glob("SRC/Auth/x.py", "src/auth/**"))
 
     def test_special_chars_are_literal(self):
         self.assertTrue(b.matches_glob("a(b)+c.py", "a(b)+c.py"))
         self.assertFalse(b.matches_glob("aXc.py", "a.c.py"))
         self.assertTrue(b.matches_glob("ab.py", "a?.py"))
         self.assertFalse(b.matches_glob("a/.py", "a?.py"))
+
+
+class NormaliseTests(Base):
+    def test_path_spellings_all_match(self):
+        for p in ("src/../src/auth/x.py", "src/./auth/x.py", "src//auth/x.py", "/src/auth/x.py",
+                  "C:\\src\\auth\\x.py", "c:/src/auth/x.py", ".\\src\\auth\\x.py"):
+            self.assertTrue(b.matches_glob(p, "src/auth/**"), p)
+            with self.assertRaises(b.BelayRefusal) as cm:
+                b.check_paths(self.cfg, [p], [])
+            self.assertEqual(cm.exception.code, 8, p)
+
+    def test_pattern_spellings_normalised(self):
+        for pat in ("./src//auth/**", "src/./auth/**", "C:/src/auth/**", "/src/auth/**"):
+            self.assertTrue(b.matches_glob("src/auth/x.py", pat), pat)
+
+    def test_escaping_path_refused(self):
+        for p in ("../x", "src/../../x", "..\\x"):
+            with self.assertRaises(b.BelayRefusal) as cm:
+                b.check_paths(self.cfg, [p], [])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("escapes the repo", cm.exception.reason)
+
+    def test_bare_str_rejected(self):
+        self.assertEqual(self.code(b.check_paths, self.cfg, "src/auth/x.py", []), 2)
+        # substring-label bypass: a bare string would make `in` a substring test
+        self.assertEqual(self.code(b.check_paths, self.cfg, ["src/auth/x.py"], "belay:approved"), 2)
+        self.assertEqual(self.code(b.check_paths, self.cfg, ["src/auth/x.py"], ["belay:approved-not"]), 8)
 
 
 class PathTests(Base):
@@ -129,6 +156,53 @@ class PathTests(Base):
 
     def test_safe_paths_pass(self):
         b.check_paths(self.cfg, ["README.md", "src/app.py"], [])
+
+
+class HardeningTests(Base):
+    def test_strip_and_validate_inputs(self):
+        self.assertEqual(self.code(b.record_evidence, self.store, self.rid, command="c", exit_code=0,
+                                   head="a", stage="", now=mins(1)), 2)
+        self.assertEqual(self.code(b.record_evidence, self.store, self.rid, command="c", exit_code=0,
+                                   head="a", stage=None, now=mins(1)), 2)
+        self.assertEqual(self.code(b.record_evidence, self.store, self.rid, command="c", exit_code=0,
+                                   head="  ", stage="s", now=mins(1)), 2)
+        self.ev(head="  abc  ")
+        self.assertEqual(self.store.load(self.rid)["evidence"][0]["head"], "abc")
+        self.assertEqual(b.hand_off(self.store, self.cfg, self.rid, " abc ", mins(2))["state"], "review")
+
+    def test_owner_casefold_and_reason(self):
+        r = b.override(self.store, self.cfg, self.rid, who=" ALICE ", kind="extend",
+                       reason="r", minutes=5, now=mins(1))
+        self.assertEqual(r["extension_minutes"], 5)
+        for reason in ("", "   ", None):
+            self.assertEqual(self.code(b.override, self.store, self.cfg, self.rid, who="alice",
+                                       kind="extend", reason=reason, minutes=5, now=mins(2)), 2)
+        cfg = replace(self.cfg, owner="  ")
+        self.assertEqual(self.code(b.override, self.store, cfg, self.rid, who="  ", kind="extend",
+                                   reason="r", minutes=5, now=mins(2)), 9)
+
+
+class ReopenGuardTests(Base):
+    def fail(self):
+        run = self.store.load(self.rid)
+        b._transition(run, "failed", mins(2), "x")
+        self.store.save(run)
+
+    def reopen(self, n=10):
+        return b.override(self.store, self.cfg, self.rid, who="alice", kind="reopen",
+                          reason="retry", now=mins(n))
+
+    def test_reopen_refused_with_stop_file(self):
+        self.fail()
+        (self.store.base / "STOP").write_text("x")
+        self.assertEqual(self.code(self.reopen), 3)
+        self.assertEqual(self.store.load(self.rid)["state"], "failed")
+
+    def test_reopen_refused_with_other_fresh_working_run(self):
+        self.fail()
+        b.claim(self.store, self.cfg, "8", mins(9))
+        self.assertEqual(self.code(self.reopen), 5)
+        self.assertEqual(self.store.load(self.rid)["state"], "failed")
 
 
 class OverrideTests(Base):
