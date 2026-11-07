@@ -171,3 +171,9 @@ appears among the line's words outside the bodies (`bash <<'EOF'`, `cat <<EOF | 
 levels. Consequence: a line that both runs a shell and commits with a heredoc message is
 examined in full (over-match). Out of scope: non-shell interpreters (`python3 - <<EOF`,
 `python -c "os.system('git push')"`, node, perl, ruby).
+
+Task 7c: a linked worktree (`.git` is a file) without its own `.belay/` uses its main
+checkout's footprint (hook: `gitdir:` -> `<gitdir>/commondir` -> parent of the main `.git`,
+no subprocess, fails open to "no footprint"; helper `_default_root`: parent of
+`git rev-parse --path-format=absolute --git-common-dir` when it is named `.git`, else
+`--show-toplevel`, else cwd; `--root` wins).

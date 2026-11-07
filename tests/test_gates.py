@@ -255,3 +255,26 @@ class OverrideTests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LabelCaseTests(Base):
+    """GitHub label names are case-insensitive: Belay:Stop and belay:stop are one label."""
+
+    def test_stop_label_matches_case_insensitively(self):
+        for lab in ("Belay:Stop", "BELAY:STOP", "  belay:stop "):
+            with self.subTest(label=lab):
+                self.assertEqual(self.code(b.check_stop, self.store.root, self.cfg, ["bug", lab]), 3)
+        b.check_stop(self.store.root, self.cfg, ["bug", "belay:stopped"])  # no raise
+
+    def test_stop_label_config_case_irrelevant(self):
+        cfg = replace(self.cfg, labels={**self.cfg.labels, "stop": "Belay:STOP"})
+        self.assertEqual(self.code(b.check_stop, self.store.root, cfg, ["belay:stop"]), 3)
+
+    def test_stop_bare_str_rejected(self):
+        self.assertEqual(self.code(b.check_stop, self.store.root, self.cfg, "belay:stop"), 2)
+
+    def test_approved_label_matches_case_insensitively(self):
+        b.check_paths(self.cfg, ["src/auth/login.py"], ["Belay:Approved"])
+        b.check_paths(self.cfg, ["src/auth/login.py"], [" BELAY:APPROVED "])
+        self.assertEqual(self.code(b.check_paths, self.cfg, ["src/auth/x.py"], ["Belay:Approved-Not"]), 8)
+        self.assertEqual(self.code(b.check_paths, self.cfg, ["src/auth/x.py"], "Belay:Approved"), 2)

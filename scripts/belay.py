@@ -309,11 +309,30 @@ class RunStore:
                 self.lock_path.unlink()
 
 
+def _label_key(label: str) -> str:
+    return label.strip().casefold()
+
+
+def _has_label(labels: Sequence[str], wanted: str) -> bool:
+    """Case-insensitive, whitespace-trimmed label match: GitHub treats `Belay:Stop` and
+    `belay:stop` as the same label. A bare string is refused (code 2): `in` on a str would be
+    a substring test."""
+    if (isinstance(labels, (str, bytes))
+            or not isinstance(labels, (list, tuple, set, frozenset))
+            or not all(isinstance(x, str) for x in labels)):
+        raise BelayRefusal(2, "labels must be a list of strings, not a bare string")
+    key = _label_key(wanted)
+    return any(_label_key(x) == key for x in labels)
+
+
 def check_stop(root: Path, cfg: Config, labels: Sequence[str] = ()) -> None:
-    """Raise BelayRefusal(3) if `<root>/.belay/STOP` exists or the stop label is present."""
+    """Raise BelayRefusal(3) if `<root>/.belay/STOP` exists or the stop label is present.
+
+    The label match ignores case and surrounding whitespace (GitHub label names are
+    case-insensitive), so it can only make the stop label stronger."""
     if (Path(root) / ".belay" / "STOP").exists():
         raise BelayRefusal(3, "stop switch: .belay/STOP exists; delete it to resume")
-    if cfg.labels["stop"] in labels:
+    if _has_label(labels, cfg.labels["stop"]):
         raise BelayRefusal(3, f"stop switch: issue has label {cfg.labels['stop']!r}")
 
 
@@ -611,7 +630,10 @@ def matches_glob(path: str, pattern: str) -> bool:
 
 
 def check_paths(cfg: Config, changed: Sequence[str], labels: Sequence[str]) -> None:
-    """Refuse (code 8) when a changed path matches cfg.high_risk_paths and the issue lacks the approved label."""
+    """Refuse (code 8) when a changed path matches cfg.high_risk_paths and the issue lacks the approved label.
+
+    The approved label matches ignoring case and surrounding whitespace, because GitHub treats
+    `Belay:Approved` and `belay:approved` as the same label."""
     for name, seq in (("changed", changed), ("labels", labels)):
         if isinstance(seq, (str, bytes)) or not isinstance(seq, (list, tuple, set, frozenset))                 or not all(isinstance(x, str) for x in seq):
             raise BelayRefusal(2, f"{name} must be a list of strings, not a bare string")
@@ -619,7 +641,7 @@ def check_paths(cfg: Config, changed: Sequence[str], labels: Sequence[str]) -> N
     for p in norm:
         if p == ".." or p.startswith("../"):
             raise BelayRefusal(2, f"changed path escapes the repo: {p}")
-    if cfg.labels["approved"] in labels:
+    if _has_label(labels, cfg.labels["approved"]):
         return
     hits = [p for p in norm if any(matches_glob(p, pat) for pat in cfg.high_risk_paths)]
     if hits:
@@ -746,15 +768,27 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _default_root() -> Path:
+def _git_out(*args: str) -> str:
     try:
-        r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
-                           text=True, timeout=10)
-        if r.returncode == 0 and r.stdout.strip():
-            return Path(r.stdout.strip())
+        r = subprocess.run(["git", *args], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return r.stdout.strip()
     except (OSError, subprocess.SubprocessError):
         pass
-    return Path.cwd()
+    return ""
+
+
+def _default_root() -> Path:
+    """The MAIN checkout root, so a linked worktree shares the main checkout's `.belay/`.
+
+    Parent of `git rev-parse --path-format=absolute --git-common-dir` when that directory is
+    named `.git`; otherwise (bare repo, submodule, old git) `--show-toplevel`, then cwd.
+    """
+    common = _git_out("rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common and Path(common).name == ".git":
+        return Path(common).parent
+    top = _git_out("rev-parse", "--show-toplevel")
+    return Path(top) if top else Path.cwd()
 
 
 def _emit(obj: dict) -> None:

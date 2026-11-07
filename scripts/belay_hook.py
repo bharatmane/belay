@@ -354,14 +354,41 @@ def classify_command(cmd: str, depth: int = 0, keep_heredocs: bool = False) -> t
 # ---------------------------------------------------------------------------
 
 
+def _main_checkout(worktree: str) -> str | None:
+    """For a linked worktree (`.git` is a FILE `gitdir: <main>/.git/worktrees/<name>`), the
+    main checkout root: <gitdir>/commondir names the main .git dir (relative to gitdir) and
+    the root is its parent. None for anything else (submodule, corrupt file, bare repo)."""
+    try:
+        with open(os.path.join(worktree, ".git"), encoding="utf-8") as f:
+            first = f.readline().strip()
+        if not first.startswith("gitdir:"):
+            return None
+        gitdir = os.path.join(worktree, first[len("gitdir:"):].strip())
+        with open(os.path.join(gitdir, "commondir"), encoding="utf-8") as f:
+            common = f.readline().strip()
+        if not common:
+            return None
+        main_git = os.path.normpath(os.path.join(gitdir, common))
+        if os.path.basename(main_git) != ".git" or not os.path.isdir(main_git):
+            return None
+        return os.path.dirname(main_git)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+
+
 def find_root(start: str) -> str | None:
     """Walk up from `start` to the first directory holding `.belay/`. Stop at a git top-level
-    (a directory holding `.git`) so a footprint above the repository never applies."""
+    (a directory holding `.git`) so a footprint above the repository never applies. A linked
+    worktree without its own `.belay/` uses its main checkout's footprint (no subprocess)."""
     d = os.path.abspath(start)
     while True:
         if os.path.isdir(os.path.join(d, ".belay")):
             return d
-        if os.path.exists(os.path.join(d, ".git")):
+        git = os.path.join(d, ".git")
+        if os.path.isfile(git):
+            main = _main_checkout(d)
+            return main if main and os.path.isdir(os.path.join(main, ".belay")) else None
+        if os.path.exists(git):
             return None
         parent = os.path.dirname(d)
         if parent == d:
