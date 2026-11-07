@@ -1,2 +1,7 @@
 #!/usr/bin/env bash
+# Prefer python3 (macOS/Linux); fall back to python when python3 is missing or a stub
+# that cannot run (the Windows Store alias exits 9009).
+if python3 -c "" >/dev/null 2>&1; then
+  exec python3 "$(dirname "$0")/fake_gh.py" "$@"
+fi
 exec python "$(dirname "$0")/fake_gh.py" "$@"

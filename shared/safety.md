@@ -56,7 +56,7 @@ helper did not run: treat it as missing (next section).
 
 ## When the helper is missing
 
-Check once at the start of a skill: `belay status` must exit 0 with `"ok": true`. If neither
+Check once at the start of any skill that calls the helper: `belay status` must exit 0 with `"ok": true`. If neither
 `python3` nor `python` runs it (missing, or older than 3.11), print this warning verbatim
 and ask the user whether to continue:
 
@@ -132,8 +132,9 @@ continues with `belay resume <run>`.
   the main checkout.
 - **Body files** for issues, comments and PRs go in the main checkout's `.belay/tmp/`. The
   hook leaves `.belay/` writable, and it is never committed.
-- **`.belay/` must be git-ignored.** Before the first claim, run `git check-ignore -q .belay`
-  in the main checkout; a non-zero exit means it is not ignored. Stop and ask the user to
+- **`.belay/` must be git-ignored.** Before the first claim, run `git check-ignore -q .belay/`
+  in the main checkout (keep the trailing slash: without it the check reports "not ignored"
+  while `.belay/` does not exist yet); a non-zero exit means it is not ignored. Stop and ask the user to
   add `.belay/` to `.gitignore` rather than risk committing run records.
 
 ## Hook and helper limits

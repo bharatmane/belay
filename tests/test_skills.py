@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 import validate_repo as v  # noqa: E402
 
-SCENARIOS = {"empty", "has-duplicate", "no-labels", "default"}
+SCENARIOS = {"empty", "has-duplicate", "injected-duplicate", "no-labels", "default"}
 
 
 def eval_files():

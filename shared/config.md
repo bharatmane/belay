@@ -13,7 +13,7 @@ reads `<root>/.belay.toml` for the root that holds `.belay/`, resolving a linked
 the same way. Details and limits are in [safety](safety.md#hook-and-helper-limits).
 
 Add `.belay/` to `.gitignore`. It holds run records, the stop file and scratch files that
-must never be committed; skills check with `git check-ignore -q .belay` and stop if it is
+must never be committed; skills check with `git check-ignore -q .belay/` and stop if it is
 not ignored.
 
 ## How the file is checked
