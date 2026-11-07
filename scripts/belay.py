@@ -2,14 +2,17 @@
 """belay helper: deterministic checks for the belay Claude Code plugin.
 
 Python 3.11+, standard library only. Sections are appended by later tasks.
+
+CLI: every command prints exactly one JSON object on stdout (usage errors included, code 2).
+The one exception is `--help`, which prints plain argparse help text and exits 0.
 """
 from __future__ import annotations
 
+import argparse
 import contextlib
 import json
 import os
 import posixpath
-import argparse
 import re
 import subprocess
 import sys
@@ -607,6 +610,9 @@ def override(store: RunStore, cfg: Config, run_id: str, *, who: str, kind: str, 
              minutes: int = 0, now: datetime) -> dict:
     """Owner-only: `extend` adds budget minutes, `reopen` moves a `failed` run back to `working`.
 
+    `who` is SELF-ASSERTED: the helper cannot verify identity. The calling skill must take the
+    owner login from the tracker CLI, and the owner must request the override in the session.
+
     Reopen honours the stop switch and the one-working-run rule like resume. It does not reset
     attempts or budget: a reopened run that is over budget needs a further `extend`.
     """
@@ -706,7 +712,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--changed", nargs="+", required=True, help="paths, or `-` to read stdin")
     sp.add_argument("--label", action="append", default=[])
     sp = cmd("override")
-    sp.add_argument("--as", required=True, dest="who")
+    sp.add_argument("--as", required=True, dest="who",
+                    help="owner login. SELF-ASSERTED: the helper cannot verify identity; the "
+                         "calling skill must take the owner login from the tracker CLI, and the "
+                         "owner must request the override in the session")
     sp.add_argument("--kind", required=True)
     sp.add_argument("--reason", required=True)
     sp.add_argument("--minutes", type=int, default=0)
@@ -726,8 +735,21 @@ def _default_root() -> Path:
 
 
 def _emit(obj: dict) -> None:
-    sys.stdout.write(json.dumps(obj, ensure_ascii=True) + "\n")
-    sys.stdout.flush()
+    """Print one JSON line. A dead stdout never raises: the exit code still carries the result."""
+    try:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=True) + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # Point stdout at devnull so interpreter shutdown does not try to flush the broken pipe.
+        with contextlib.suppress(OSError, ValueError):
+            sys.stdout = open(os.devnull, "w")
+    except (OSError, ValueError):
+        pass
+
+
+def _read_paths(text: str) -> list[str]:
+    """Newline-separated paths: only the line ending is removed; blank lines are skipped."""
+    return [ln.rstrip("\r\n") for ln in text.splitlines() if ln.strip()]
 
 
 def _run_summary(run: dict) -> dict:
@@ -763,11 +785,14 @@ def _dispatch(args, root: Path, cfg: Config, store: RunStore, now: datetime) -> 
         changed: list[str] = []
         for v in args.changed:
             if v == "-":
-                changed.extend(ln.strip() for ln in sys.stdin.read().splitlines() if ln.strip())
+                changed.extend(_read_paths(sys.stdin.read()))
             else:
                 changed.append(v)
         check_paths(cfg, changed, args.label)
-        return {"checked": len(changed)}
+        res: dict = {"checked": len(changed)}
+        if not changed:
+            res["_warnings"] = ["no changed paths were supplied; the high-risk gate checked nothing"]
+        return res
     if c == "override":
         return _run_summary(override(store, cfg, args.run, who=args.who, kind=args.kind,
                                      reason=args.reason, minutes=args.minutes, now=now))
@@ -789,6 +814,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not cfg_path.is_file():
             warnings.append(f"config file not found: {cfg_path}; using defaults")
         result = _dispatch(args, root, cfg, RunStore(root), datetime.now(timezone.utc))
+        warnings += result.pop("_warnings", [])
         _emit({"ok": True, **result, "warnings": warnings})
         return 0
     except BelayRefusal as e:

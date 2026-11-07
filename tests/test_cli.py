@@ -147,6 +147,63 @@ class TestCli(CliBase):
         self.assertEqual(self.run_cli("check-stop")[0], 0)
 
 
+class TestRobustness(CliBase):
+    def test_broken_pipe_does_not_escape_and_keeps_exit_code(self):
+        class Dead:
+            def write(self, _):
+                raise BrokenPipeError()
+
+            def flush(self):
+                raise BrokenPipeError()
+
+        old = sys.stdout
+        try:
+            sys.stdout = Dead()
+            code = b.main(["--root", str(self.root), "heartbeat", "nope"])
+            sys.stdout.close()
+            sys.stdout = Dead()
+            code_ok = b.main(["--root", str(self.root), "status"])
+        finally:
+            if hasattr(sys.stdout, "close"):
+                sys.stdout.close()
+            sys.stdout = old
+        self.assertEqual(code, 6)
+        self.assertEqual(code_ok, 0)
+
+    def test_oserror_on_write_is_swallowed(self):
+        class Full:
+            def write(self, _):
+                raise OSError("disk full")
+
+            def flush(self):
+                pass
+
+        old = sys.stdout
+        sys.stdout = Full()
+        try:
+            code = b.main(["--root", str(self.root), "status"])
+        finally:
+            sys.stdout = old
+        self.assertEqual(code, 0)
+
+    def test_empty_stdin_warns(self):
+        old = sys.stdin
+        sys.stdin = io.StringIO("")
+        try:
+            code, data = self.run_cli("check-paths", "--changed", "-")
+        finally:
+            sys.stdin = old
+        self.assertEqual(code, 0)
+        self.assertTrue(any("checked nothing" in w for w in data["warnings"]))
+
+    def test_nonempty_check_paths_has_no_empty_warning(self):
+        code, data = self.run_cli("check-paths", "--changed", "a.py")
+        self.assertFalse(any("checked nothing" in w for w in data["warnings"]))
+
+    def test_read_paths_preserves_spaces_and_skips_blank(self):
+        self.assertEqual(b._read_paths(" a b.py \r\n\n  \nc.py\n"), [" a b.py ", "c.py"])
+
+
 class TestScript(unittest.TestCase):
     def test_runs_as_script_via_subprocess(self):
         with tempfile.TemporaryDirectory() as d:
