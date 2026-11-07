@@ -24,15 +24,9 @@ def main(argv):
     state = scratch / ".fake-gh" / "state.json"
     fake_gh.save(state, fake_gh.seed(scenario))
     subprocess.run(["git", "init", "-q"], cwd=scratch, check=False)
-    (scratch / ".gitignore").write_text(".belay/
-.fake-gh/
-", encoding="utf-8")
+    (scratch / ".gitignore").write_text(".belay/\n.fake-gh/\n", encoding="utf-8")
     (scratch / ".belay.toml").write_text(
-        'tracker = "github"
-
-[github]
-repo = "example/fake"
-', encoding="utf-8")
+        'tracker = "github"\n\n[github]\nrepo = "example/fake"\n', encoding="utf-8")
     print(f"scratch:  {scratch}")
     print(f"scenario: {scenario}")
     print(f"state:    {state}")
