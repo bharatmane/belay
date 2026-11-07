@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -183,6 +184,8 @@ class TestRobustness(CliBase):
         try:
             code = b.main(["--root", str(self.root), "status"])
         finally:
+            if hasattr(sys.stdout, "close"):
+                sys.stdout.close()
             sys.stdout = old
         self.assertEqual(code, 0)
 
@@ -205,6 +208,23 @@ class TestRobustness(CliBase):
 
 
 class TestScript(unittest.TestCase):
+    def test_dead_stdout_pipe_exits_cleanly(self):
+        # Reader end closed before the child starts: deterministic, no race.
+        r, w = os.pipe()
+        os.close(r)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                (Path(d) / ".belay").mkdir()
+                (Path(d) / ".belay" / "STOP").write_text("")
+                for args, want in ((["status"], 0), (["check-stop"], 3)):
+                    p = subprocess.run([sys.executable, "-I", str(ROOT / "scripts" / "belay.py"),
+                                        "--root", d, *args], stdout=w, stderr=subprocess.PIPE,
+                                       text=True)
+                    self.assertEqual(p.returncode, want, p.stderr)
+                    self.assertEqual(p.stderr, "")
+        finally:
+            os.close(w)
+
     def test_runs_as_script_via_subprocess(self):
         with tempfile.TemporaryDirectory() as d:
             p = subprocess.run([sys.executable, str(ROOT / "scripts" / "belay.py"), "status"], capture_output=True, text=True, cwd=d)

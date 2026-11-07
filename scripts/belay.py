@@ -739,12 +739,16 @@ def _emit(obj: dict) -> None:
     try:
         sys.stdout.write(json.dumps(obj, ensure_ascii=True) + "\n")
         sys.stdout.flush()
-    except BrokenPipeError:
-        # Point stdout at devnull so interpreter shutdown does not try to flush the broken pipe.
+    except (OSError, ValueError):
+        # Dead stdout (BrokenPipeError, or plain OSError EINVAL on Windows). Repoint fd 1 and
+        # sys.stdout at devnull so interpreter shutdown does not try to flush the dead pipe.
+        if sys.stdout is sys.__stdout__:  # never clobber fd 1 under a test's replaced stdout
+            with contextlib.suppress(OSError, ValueError):
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, 1)
+                os.close(devnull)
         with contextlib.suppress(OSError, ValueError):
             sys.stdout = open(os.devnull, "w")
-    except (OSError, ValueError):
-        pass
 
 
 def _read_paths(text: str) -> list[str]:
