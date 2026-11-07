@@ -47,7 +47,7 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(r["active_seconds"], 1200)
         r = b.heartbeat(self.store, self.cfg, self.rid, mins(55))
         self.assertEqual(r["active_seconds"], 1500)
-        notes = [h for h in r["history"] if isinstance(h, dict)]
+        notes = r["history"]
         self.assertEqual([(h["from"], h["to"]) for h in notes],
                          [("working", "waiting"), ("waiting", "working")])
         self.assertEqual(notes[0]["note"], "ci")
@@ -107,6 +107,37 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(r["active_seconds"], 60)
         self.assertEqual(r["state"], "waiting")
         self.assertEqual(r["heartbeat"], "2026-01-02T03:30:00Z")
+
+    def test_resume_blocked_by_other_fresh_working_run(self):
+        b.wait(self.store, self.cfg, self.rid, "x", mins(1))
+        other = self.store.create("8", "github", mins(5))
+        self.assertEqual(self.code(b.resume, self.store, self.cfg, self.rid, mins(10)), 5)
+        # stale other run does not block
+        self.assertEqual(b.resume(self.store, self.cfg, self.rid, mins(200))["state"], "working")
+        self.assertTrue(other["run_id"])
+
+    def test_resume_honors_stop_switch(self):
+        b.wait(self.store, self.cfg, self.rid, "x", mins(1))
+        (self.store.base).mkdir(parents=True, exist_ok=True)
+        (self.store.base / "STOP").write_text("")
+        self.assertEqual(self.code(b.resume, self.store, self.cfg, self.rid, mins(2)), 3)
+
+    def test_corrupt_fields_refuse_code_2(self):
+        for field, bad in (("last_tick", "garbage"), ("active_seconds", "x")):
+            run = self.store.load(self.rid)
+            run[field] = bad
+            self.store.save(run)
+            self.assertEqual(self.code(b.heartbeat, self.store, self.cfg, self.rid, mins(1)), 2)
+            run[field] = T0 and ("2026-01-02T03:00:00Z" if field == "last_tick" else 0)
+            self.store.save(run)
+        run = self.store.load(self.rid)
+        run["extension_minutes"] = "x"
+        self.assertEqual(self.code(b.budget, self.cfg, run, mins(1)), 2)
+
+    def test_attempt_requires_working_and_stage(self):
+        self.assertEqual(self.code(b.attempt, self.store, self.cfg, self.rid, "  ", mins(1)), 2)
+        b.wait(self.store, self.cfg, self.rid, "x", mins(1))
+        self.assertEqual(self.code(b.attempt, self.store, self.cfg, self.rid, "build", mins(2)), 6)
 
 
 if __name__ == "__main__":

@@ -75,7 +75,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(new["issue"], "2")
         old = self.store.load(run["run_id"])
         self.assertEqual(old["state"], "failed")
-        self.assertIn("stale", [h if isinstance(h, str) else h.get("note") for h in old["history"]])
+        self.assertEqual([(h["from"], h["to"], h["note"]) for h in old["history"]], [("working", "failed", "stale")])
 
     def test_fresh_run_same_issue_is_still_refused(self):
         b.claim(self.store, self.cfg, "1", NOW)

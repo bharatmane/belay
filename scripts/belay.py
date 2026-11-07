@@ -269,6 +269,8 @@ class RunStore:
         """Exclusive-create lock file; retries up to LOCK_TIMEOUT seconds, then refuses (code 2).
 
         A lock left by a crashed process is never stolen automatically; the refusal names it.
+        Not reentrant: never call a function that takes this lock (claim, heartbeat, attempt,
+        wait, resume) while already holding it, or it will time out.
         """
         self.base.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + self.LOCK_TIMEOUT
@@ -331,8 +333,7 @@ def claim(store: RunStore, cfg: Config, issue: str, now: datetime,
             if resumed is None and run.get("issue") == issue:
                 resumed = run
                 continue
-            run["state"] = "failed"
-            run.setdefault("history", []).append("stale")
+            _transition(run, "failed", now, "stale")
             store.save(run)
         return resumed if resumed is not None else store.create(issue, cfg.tracker, now)
 
@@ -349,11 +350,22 @@ def _load_for_update(store: RunStore, run_id: str) -> dict:
     return store.load(run_id)
 
 
+def _num(run: dict, field: str, default=None) -> float:
+    v = run.get(field, default)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise BelayRefusal(2, f"corrupt run record {run.get('run_id')}: {field} is not a number")
+    return v
+
+
 def _credit(cfg: Config, run: dict, now: datetime) -> None:
     """Credit working time since last_tick (capped at idle_minutes, never negative); move ticks."""
     if run.get("state") == "working":
-        gap = (now - _parse_iso(run["last_tick"])).total_seconds()
-        run["active_seconds"] = run.get("active_seconds", 0) + min(max(gap, 0), cfg.idle_minutes * 60)
+        try:
+            last = _parse_iso(run["last_tick"])
+        except (KeyError, TypeError, ValueError):
+            raise BelayRefusal(2, f"corrupt run record {run.get('run_id')}: bad last_tick") from None
+        gap = (now - last).total_seconds()
+        run["active_seconds"] = _num(run, "active_seconds", 0) + min(max(gap, 0), cfg.idle_minutes * 60)
     run["last_tick"] = run["heartbeat"] = _iso(now)
 
 
@@ -364,8 +376,8 @@ def _transition(run: dict, to: str, now: datetime, note: str) -> None:
 
 
 def budget(cfg: Config, run: dict, now: datetime) -> dict:
-    limit = cfg.active_minutes + run.get("extension_minutes", 0)
-    active = run.get("active_seconds", 0) / 60
+    limit = cfg.active_minutes + _num(run, "extension_minutes", 0)
+    active = _num(run, "active_seconds", 0) / 60
     return {"active_minutes": active, "limit_minutes": limit,
             "remaining_minutes": max(limit - active, 0),
             "attempts": dict(run.get("attempts", {})), "spent": active >= limit}
@@ -385,8 +397,12 @@ def heartbeat(store: RunStore, cfg: Config, run_id: str, now: datetime) -> dict:
 
 
 def attempt(store: RunStore, cfg: Config, run_id: str, stage: str, now: datetime) -> dict:
+    if not isinstance(stage, str) or not stage.strip():
+        raise BelayRefusal(2, "stage must be a non-empty string")
     with store.lock():
         run = _load_for_update(store, run_id)
+        if run.get("state") != "working":
+            raise BelayRefusal(6, f"cannot attempt: run {run_id} is {run.get('state')}, not working")
         attempts = run.setdefault("attempts", {})
         if attempts.get(stage, 0) >= cfg.attempts_per_stage:
             raise BelayRefusal(4, f"attempts spent for stage {stage!r}: "
@@ -409,11 +425,23 @@ def wait(store: RunStore, cfg: Config, run_id: str, reason: str, now: datetime) 
 
 
 def resume(store: RunStore, cfg: Config, run_id: str, now: datetime) -> dict:
+    check_stop(store.root, cfg)
     now = _parse_iso(_iso(now))
     with store.lock():
         run = _load_for_update(store, run_id)
         if run.get("state") != "waiting":
             raise BelayRefusal(6, f"cannot resume: run {run_id} is {run.get('state')}, not waiting")
+        for other in store.list_runs():
+            if other["run_id"] == run_id or other.get("state") != "working":
+                continue
+            try:
+                age = now - _parse_iso(other["heartbeat"])
+            except (KeyError, TypeError, ValueError):
+                raise BelayRefusal(
+                    2, f"corrupt run record {store._path(other['run_id'])}: bad heartbeat") from None
+            if age <= timedelta(minutes=cfg.idle_minutes):
+                raise BelayRefusal(
+                    5, f"run {other['run_id']} (issue {other.get('issue')}) is already working")
         _credit(cfg, run, now)  # waiting: moves ticks only, credits nothing
         _transition(run, "working", now, "resumed")
         store.save(run)
