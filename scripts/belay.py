@@ -5,11 +5,17 @@ Python 3.11+, standard library only. Sections are appended by later tasks.
 """
 from __future__ import annotations
 
+import contextlib
+import json
+import os
 import re
+import time
 import tomllib
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Iterator, Sequence
 
 # ---------------------------------------------------------------------------
 # Refusals
@@ -147,3 +153,162 @@ def make_run_id(issue: str, now: datetime) -> str:
         now = now.astimezone(timezone.utc)
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(issue))
     return f"{now.strftime('%Y%m%dT%H%M%SZ')}-{safe}"
+
+
+# ---------------------------------------------------------------------------
+# Run store, claim, stop switch, stale recovery
+# ---------------------------------------------------------------------------
+
+
+def _iso(dt: datetime) -> str:
+    """UTC ISO-8601 with a trailing Z. A naive datetime is treated as UTC."""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_iso(text: str) -> datetime:
+    return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+
+def _replace_with_retry(src: Path, dst: Path) -> None:
+    """os.replace, retrying briefly: Windows raises PermissionError while another handle is open."""
+    for attempt in range(50):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == 49:
+                raise
+            time.sleep(0.02)
+
+
+class RunStore:
+    """Run records as `<root>/.belay/runs/<run_id>.json`.
+
+    Corrupt records: `load` raises BelayRefusal(2) naming the file. `list_runs` does NOT skip
+    corrupt files (a skipped record could hide a working run and allow a double claim); it
+    raises the same refusal, so the user must repair or delete the named file. The file is
+    never modified or deleted by belay.
+    """
+
+    LOCK_TIMEOUT = 5.0
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+        self.base = self.root / ".belay"
+        self.runs_dir = self.base / "runs"
+        self.lock_path = self.base / "lock"
+
+    def _path(self, run_id: str) -> Path:
+        return self.runs_dir / f"{run_id}.json"
+
+    def create(self, issue: str, tracker: str, now: datetime) -> dict:
+        ts = _iso(now)
+        run = {
+            "run_id": make_run_id(issue, now), "issue": str(issue), "tracker": tracker,
+            "state": "working", "stage": "start", "started_at": ts, "heartbeat": ts,
+            "last_tick": ts, "active_seconds": 0, "attempts": {}, "evidence": [],
+            "history": [], "overrides": [], "extension_minutes": 0,
+        }
+        self.save(run)
+        return run
+
+    def load(self, run_id: str) -> dict:
+        return self._read(self._path(run_id))
+
+    def _read(self, path: Path) -> dict:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raise BelayRefusal(2, f"run record not found: {path}") from None
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+            raise BelayRefusal(2, f"corrupt run record {path}: {e}; repair or delete this file") from None
+        if not isinstance(data, dict) or not isinstance(data.get("run_id"), str):
+            raise BelayRefusal(2, f"corrupt run record {path}: not a run object; repair or delete this file")
+        return data
+
+    def save(self, run: dict) -> None:
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        dst = self._path(run["run_id"])
+        tmp = self.runs_dir / f".{dst.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(run, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            _replace_with_retry(tmp, dst)
+        finally:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+
+    def list_runs(self) -> list[dict]:
+        """All run records sorted by run_id. Raises BelayRefusal(2) on any corrupt record."""
+        if not self.runs_dir.is_dir():
+            return []
+        return [self._read(p) for p in sorted(self.runs_dir.glob("*.json"))]
+
+    @contextlib.contextmanager
+    def lock(self) -> Iterator[None]:
+        """Exclusive-create lock file; retries up to LOCK_TIMEOUT seconds, then refuses (code 2).
+
+        A lock left by a crashed process is never stolen automatically; the refusal names it.
+        """
+        self.base.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self.LOCK_TIMEOUT
+        while True:
+            try:
+                fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except (FileExistsError, PermissionError):
+                if time.monotonic() >= deadline:
+                    raise BelayRefusal(
+                        2, f"could not acquire lock {self.lock_path} within {self.LOCK_TIMEOUT:g}s; "
+                           "if no belay process is running, delete that file") from None
+                time.sleep(0.01)
+        try:
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            fd = -1
+            yield
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            with contextlib.suppress(OSError):
+                self.lock_path.unlink()
+
+
+def check_stop(root: Path, cfg: Config, labels: Sequence[str] = ()) -> None:
+    """Raise BelayRefusal(3) if `<root>/.belay/STOP` exists or the stop label is present."""
+    if (Path(root) / ".belay" / "STOP").exists():
+        raise BelayRefusal(3, "stop switch: .belay/STOP exists; delete it to resume")
+    if cfg.labels["stop"] in labels:
+        raise BelayRefusal(3, f"stop switch: issue has label {cfg.labels['stop']!r}")
+
+
+def claim(store: RunStore, cfg: Config, issue: str, now: datetime,
+          labels: Sequence[str] = ()) -> dict:
+    """Claim `issue` for a run. Only a `working` run blocks (code 5); a stale one is recovered.
+
+    Stale = heartbeat older than cfg.idle_minutes. Same issue: resumed unchanged. Other issue:
+    marked `failed` with history note `stale`, then a new run is created.
+    """
+    check_stop(store.root, cfg, labels)
+    with store.lock():
+        for run in store.list_runs():
+            if run.get("state") != "working":
+                continue
+            try:
+                age = now - _parse_iso(run["heartbeat"])
+            except (KeyError, TypeError, ValueError):
+                raise BelayRefusal(
+                    2, f"corrupt run record {store._path(run['run_id'])}: bad heartbeat") from None
+            if age <= timedelta(minutes=cfg.idle_minutes):
+                raise BelayRefusal(
+                    5, f"run {run['run_id']} (issue {run.get('issue')}) is already working")
+            if run.get("issue") == str(issue):
+                return run
+            run["state"] = "failed"
+            run.setdefault("history", []).append("stale")
+            store.save(run)
+        return store.create(issue, cfg.tracker, now)
