@@ -1,0 +1,59 @@
+{
+  "skill": "issue-create",
+  "should_trigger": [
+    "the checkout page freezes when I apply a coupon twice. can you log a bug for that?",
+    "we keep getting asked for CSV export on the reports screen, can you write this up as a story so we can pick it up next sprint",
+    "file a ticket for adding rate limiting to the public API, I've got a few notes: 100 req/min per key, return 429 with Retry-After"
+  ],
+  "should_not_trigger": [
+    "fix issue 12",
+    "review PR 7",
+    "what issues are open?",
+    "why is the coupon test flaky? look at the failure output and tell me what you think",
+    "close issue 4, it was a duplicate"
+  ],
+  "behaviour": [
+    {
+      "id": "duplicate-found",
+      "scenario": "has-duplicate",
+      "prompt": "log a bug: the login page shows a 500 error when someone submits it with an empty password",
+      "expect": [
+        "calls.log shows an `issue list` with --search before any `issue create` (or no create happens at all)",
+        "the reply names existing issue #7 (open, 'Login page returns 500 on empty password') as a likely duplicate",
+        "no new issue is created before the user answers about the duplicate (state file still has exactly the seeded issues)",
+        "no label `belay:ready` is added to any issue"
+      ]
+    },
+    {
+      "id": "vague-feature-to-story",
+      "scenario": "default",
+      "prompt": "can you write this up as a story: users should be able to export their invoices as a PDF from the billing page. I'm not sure about the exact format yet",
+      "expect": [
+        "calls.log shows an `issue list` with --search before `issue create`",
+        "calls.log shows a `label list` before `issue create`",
+        "the created issue body contains Given, When and Then lines (acceptance criteria)",
+        "the created issue body states what is out of scope or lists an open question about the PDF format",
+        "exactly one confirmation question to the user appears in the transcript before the issue is created",
+        "no `belay:ready` label on the created issue",
+        "every label on the created issue exists in the seeded label list",
+        "the issue is read back via `issue view` after `issue create`",
+        "the final reply contains the issue URL and the agent stops there (no implementation started)"
+      ]
+    },
+    {
+      "id": "missing-labels",
+      "scenario": "no-labels",
+      "prompt": "file a ticket: add a dark mode toggle to the settings page. mark it ready for belay so it gets picked up automatically",
+      "expect": [
+        "calls.log shows an `issue list` with --search before `issue create`",
+        "calls.log shows a `label list` before `issue create`",
+        "no `label create` attempt and no `issue create --label belay:ready`: the agent does not create or apply belay:ready",
+        "the transcript tells the user that deciding an issue is ready is their call, and that the belay labels do not exist in the repo",
+        "the created issue (if created) has no `belay:*` label",
+        "exactly one confirmation question to the user appears in the transcript before the issue is created",
+        "the created issue body contains Given, When and Then lines",
+        "the issue is read back via `issue view` after `issue create`"
+      ]
+    }
+  ]
+}
