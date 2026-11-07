@@ -1,0 +1,31 @@
+# Belay configuration. Copy to .belay.toml in your repository root and edit.
+# Every key is optional; the values below are the defaults unless marked "example".
+# Reference: shared/config.md
+
+tracker = "github"            # "github" ("jira" is planned, not yet supported)
+base_branch = "main"          # branch that worktrees start from and PRs target
+idle_minutes = 60             # idle time beyond this is not credited; older heartbeats are stale
+high_risk_paths = []          # globs that need the approved label, e.g. ["migrations/**", "src/auth/"]
+test_command = ""             # what "tests pass" means here, e.g. "python -m pytest -q"
+owner = ""                    # GitHub login allowed to extend or reopen runs; empty = nobody
+pr_draft = true               # open new PRs as drafts
+
+[github]
+repo = ""                     # "owner/name"; empty = the repository of the current directory
+
+[jira]                        # reserved for the planned Jira adapter; ignored today
+site = ""                     # example: "example.atlassian.net"
+project = ""                  # example: "PROJ"
+
+[labels]                      # label names on the tracker; change them if they clash
+ready = "belay:ready"
+working = "belay:working"
+waiting = "belay:waiting"
+review = "belay:review"
+failed = "belay:failed"
+stop = "belay:stop"
+approved = "belay:approved"
+
+[budget]
+active_minutes = 90           # working time per run; waiting on a human does not count
+attempts_per_stage = 3        # tries per stage before the run stops
