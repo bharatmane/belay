@@ -9,7 +9,10 @@ import contextlib
 import json
 import os
 import posixpath
+import argparse
 import re
+import subprocess
+import sys
 import time
 import tomllib
 import uuid
@@ -638,3 +641,163 @@ def override(store: RunStore, cfg: Config, run_id: str, *, who: str, kind: str, 
         ovs.append({"who": who, "kind": kind, "reason": reason, "at": _iso(now)})
         store.save(run)
         return run
+
+
+# ---------------------------------------------------------------------------
+# Command-line interface (the only place that reads the real clock)
+# ---------------------------------------------------------------------------
+
+
+def status(store: RunStore, cfg: Config, now: datetime) -> list[dict]:
+    """One summary per run: run_id, issue, state, active_minutes, remaining_minutes, stale."""
+    now = _parse_iso(_iso(now))
+    out = []
+    for run in store.list_runs():
+        bd = budget(cfg, run, now)
+        stale = False
+        if run.get("state") == "working":
+            try:
+                stale = now - _parse_iso(run["heartbeat"]) > timedelta(minutes=cfg.idle_minutes)
+            except (KeyError, TypeError, ValueError):
+                stale = True
+        out.append({"run_id": run["run_id"], "issue": run.get("issue"), "state": run.get("state"),
+                    "active_minutes": bd["active_minutes"],
+                    "remaining_minutes": bd["remaining_minutes"], "stale": stale})
+    return out
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str):  # usage errors become a JSON refusal, code 2
+        raise BelayRefusal(2, f"usage: {message}")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = _Parser(prog="belay.py", description="belay helper")
+    p.add_argument("--root", help="repository root (default: git top-level, else cwd)")
+    p.add_argument("--config", help="config file (default: <root>/.belay.toml)")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    def cmd(name, run=True):
+        sp = sub.add_parser(name)
+        if run:
+            sp.add_argument("run")
+        return sp
+
+    sp = cmd("claim", run=False)
+    sp.add_argument("issue")
+    sp.add_argument("--label", action="append", default=[])
+    cmd("heartbeat")
+    cmd("budget")
+    sp = cmd("attempt")
+    sp.add_argument("stage")
+    sp = cmd("wait")
+    sp.add_argument("--reason", required=True)
+    cmd("resume")
+    sp = cmd("evidence")
+    sp.add_argument("--cmd", required=True, dest="command_line")
+    sp.add_argument("--exit-code", required=True, type=int)
+    sp.add_argument("--head", required=True)
+    sp.add_argument("--stage", required=True)
+    sp = cmd("hand-off")
+    sp.add_argument("--head", required=True)
+    sp = cmd("check-stop", run=False)
+    sp.add_argument("--label", action="append", default=[])
+    sp = cmd("check-paths", run=False)
+    sp.add_argument("--changed", nargs="+", required=True, help="paths, or `-` to read stdin")
+    sp.add_argument("--label", action="append", default=[])
+    sp = cmd("override")
+    sp.add_argument("--as", required=True, dest="who")
+    sp.add_argument("--kind", required=True)
+    sp.add_argument("--reason", required=True)
+    sp.add_argument("--minutes", type=int, default=0)
+    cmd("status", run=False)
+    return p
+
+
+def _default_root() -> Path:
+    try:
+        r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
+                           text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            return Path(r.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return Path.cwd()
+
+
+def _emit(obj: dict) -> None:
+    sys.stdout.write(json.dumps(obj, ensure_ascii=True) + "\n")
+    sys.stdout.flush()
+
+
+def _run_summary(run: dict) -> dict:
+    return {"run_id": run["run_id"], "state": run.get("state"), "run": run}
+
+
+def _dispatch(args, root: Path, cfg: Config, store: RunStore, now: datetime) -> dict:
+    c = args.command
+    if c == "claim":
+        return _run_summary(claim(store, cfg, args.issue, now, args.label))
+    if c == "heartbeat":
+        return _run_summary(heartbeat(store, cfg, args.run, now))
+    if c == "budget":
+        with store.lock():
+            run = _load_for_update(store, args.run)
+        return {"run_id": args.run, **budget(cfg, run, now)}
+    if c == "attempt":
+        return _run_summary(attempt(store, cfg, args.run, args.stage, now))
+    if c == "wait":
+        return _run_summary(wait(store, cfg, args.run, args.reason, now))
+    if c == "resume":
+        return _run_summary(resume(store, cfg, args.run, now))
+    if c == "evidence":
+        return _run_summary(record_evidence(
+            store, args.run, command=args.command_line, exit_code=args.exit_code,
+            head=args.head, stage=args.stage, now=now))
+    if c == "hand-off":
+        return _run_summary(hand_off(store, cfg, args.run, args.head, now))
+    if c == "check-stop":
+        check_stop(root, cfg, args.label)
+        return {}
+    if c == "check-paths":
+        changed: list[str] = []
+        for v in args.changed:
+            if v == "-":
+                changed.extend(ln.strip() for ln in sys.stdin.read().splitlines() if ln.strip())
+            else:
+                changed.append(v)
+        check_paths(cfg, changed, args.label)
+        return {"checked": len(changed)}
+    if c == "override":
+        return _run_summary(override(store, cfg, args.run, who=args.who, kind=args.kind,
+                                     reason=args.reason, minutes=args.minutes, now=now))
+    if c == "status":
+        return {"runs": status(store, cfg, now)}
+    raise BelayRefusal(2, f"unknown command {c!r}")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run one subcommand. Prints exactly one JSON object on stdout; returns the exit code."""
+    try:
+        try:
+            args = _build_parser().parse_args(argv)
+        except SystemExit as e:  # --help
+            return e.code if isinstance(e.code, int) else 0
+        root = Path(args.root) if args.root else _default_root()
+        cfg_path = Path(args.config) if args.config else root / ".belay.toml"
+        cfg, warnings = load_config(cfg_path)
+        if not cfg_path.is_file():
+            warnings.append(f"config file not found: {cfg_path}; using defaults")
+        result = _dispatch(args, root, cfg, RunStore(root), datetime.now(timezone.utc))
+        _emit({"ok": True, **result, "warnings": warnings})
+        return 0
+    except BelayRefusal as e:
+        _emit({"ok": False, "code": e.code, "reason": e.reason})
+        return e.code
+    except Exception as e:  # never a traceback
+        _emit({"ok": False, "code": 2, "reason": f"{type(e).__name__}: {e}"})
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
