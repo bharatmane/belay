@@ -18,7 +18,7 @@ OPERATIONS = ("find_ready", "get_issue", "set_state", "comment", "read_new_comme
 EXIT_CODES = (0, 2, 3, 4, 5, 6, 7, 8, 9)
 TEMPLATES = {
     "issue.md": {"goal", "context", "acceptance_criteria", "evidence", "out_of_scope",
-                 "stop_and_ask", "risks"},
+                 "open_questions", "stop_and_ask", "risks"},
     "pr-body.md": {"issue_ref", "why", "what", "verification", "risks", "run_id"},
     "run-comment.md": {"run_id", "event", "state_label", "details"},
     "escape-hatch.md": {"run_id", "limit", "code", "head", "branch", "last_evidence",

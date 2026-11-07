@@ -14,6 +14,7 @@ and ask.
 | `{{acceptance_criteria}}` | A numbered list, each item `Given ... When ... Then ...`, each one checkable by a test or a person. |
 | `{{evidence}}` | What proves it is done: the test command or the observable behaviour a reviewer can check. |
 | `{{out_of_scope}}` | What this issue deliberately does not change, so the work stays bounded. |
+| `{{open_questions}}` | What the request left undecided, one question per bullet. Never fill a gap with a guess. `None.` if the request settled everything. |
 | `{{risks}}` | What could break, including any `high_risk_paths` likely to change. `None known.` if none. |
 | `{{stop_and_ask}}` | Situations where the builder must stop and ask instead of choosing, for example "the API contract needs to change". |
 
@@ -47,6 +48,10 @@ and ask.
 ## Out of scope
 
 {{out_of_scope}}
+
+## Open questions
+
+{{open_questions}}
 
 ## Risks
 
