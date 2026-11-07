@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,7 +45,7 @@ class Config:
     test_command: str = ""
     owner: str = ""
     pr_draft: bool = True
-    labels: dict[str, str] = None  # type: ignore[assignment]
+    labels: dict[str, str] = field(default_factory=lambda: {n: f"belay:{n}" for n in LABEL_NAMES})
     active_minutes: int = 90
     attempts_per_stage: int = 3
     github_repo: str = ""
@@ -78,7 +78,7 @@ def load_config(path: Path | None) -> tuple[Config, list[str]]:
     data: dict = {}
     if path is not None and Path(path).is_file():
         try:
-            data = tomllib.loads(Path(path).read_text(encoding="utf-8"))
+            data = tomllib.loads(Path(path).read_text(encoding="utf-8-sig"))
         except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError) as e:
             raise BelayRefusal(2, f"cannot read config {path}: {e}") from None
 
@@ -108,9 +108,11 @@ def load_config(path: Path | None) -> tuple[Config, list[str]]:
         raise _bad("budget.attempts_per_stage must be > 0")
 
     labels = {n: f"belay:{n}" for n in LABEL_NAMES}
-    for n, v in _section(data, "labels").items():
-        if n in labels:
-            labels[n] = _typed(_section(data, "labels"), n, str, labels[n], "labels.")
+    label_sec = _section(data, "labels")
+    for n in labels:
+        labels[n] = _typed(label_sec, n, str, labels[n], "labels.")
+        if not labels[n].strip():
+            raise _bad(f"labels.{n} must not be empty")
 
     gh, jira = _section(data, "github"), _section(data, "jira")
     cfg = Config(
@@ -137,7 +139,10 @@ def load_config(path: Path | None) -> tuple[Config, list[str]]:
 
 
 def make_run_id(issue: str, now: datetime) -> str:
-    """`YYYYMMDDTHHMMSSZ-<issue>` with the issue sanitised to [A-Za-z0-9_-]."""
+    """`YYYYMMDDTHHMMSSZ-<issue>` with the issue sanitised to [A-Za-z0-9_-].
+
+    A naive `now` is treated as UTC.
+    """
     if now.tzinfo is not None:
         now = now.astimezone(timezone.utc)
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(issue))

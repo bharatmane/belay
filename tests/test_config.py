@@ -94,12 +94,39 @@ attempts_per_stage = 5
             b.load_config(write('tracker = "linear"\n'))
         self.assertEqual(cm.exception.code, 2)
 
+    def test_bom_prefixed_config_loads(self):
+        d = Path(tempfile.mkdtemp())
+        f = d / ".belay.toml"
+        f.write_bytes(b"\xef\xbb\xbf" + b'base_branch = "dev"\n')
+        cfg, _ = b.load_config(f)
+        self.assertEqual(cfg.base_branch, "dev")
+
+    def test_empty_label_override_refused(self):
+        with self.assertRaises(b.BelayRefusal) as cm:
+            b.load_config(write('[labels]\nready = ""\n'))
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_wrong_value_types_refused(self):
+        for text in ('idle_minutes = "5"\n', "pr_draft = 1\n", 'github = "x"\n',
+                     "idle_minutes = true\n"):
+            with self.assertRaises(b.BelayRefusal) as cm:
+                b.load_config(write(text))
+            self.assertEqual(cm.exception.code, 2, text)
+
+    def test_default_labels_not_shared_and_frozen(self):
+        c1, _ = b.load_config(None)
+        self.assertEqual(c1.labels["ready"], "belay:ready")
+        self.assertEqual(b.Config().labels["stop"], "belay:stop")
+        with self.assertRaises(Exception):
+            c1.tracker = "jira"
+
 
 class RunIdTests(unittest.TestCase):
     def test_run_id_sanitises_issue(self):
         now = datetime(2026, 11, 7, 9, 5, 3, tzinfo=timezone.utc)
         self.assertEqual(b.make_run_id("42", now), "20261107T090503Z-42")
         self.assertEqual(b.make_run_id("PROJ-12/x y", now), "20261107T090503Z-PROJ-12_x_y")
+        self.assertEqual(b.make_run_id("7", datetime(2026, 1, 2, 3, 4, 5)), "20260102T030405Z-7")
         rid = b.make_run_id("a/b c!", now)
         self.assertRegex(rid, r"^20261107T090503Z-[A-Za-z0-9_-]+$")
         self.assertNotIn("/", rid)
