@@ -162,3 +162,12 @@ spent budget (run records change only through `scripts/belay.py`); other `.belay
 stay editable. Human-only also covers `gh api` `mergePullRequest`,
 `enablePullRequestAutoMerge`, `APPROVE` and `event=approve`, and `git push --mirror`;
 force/approve flags are read from option tokens only (an option's value is skipped).
+
+Fix round 2: a heredoc body is executed when a shell consumes it, so bodies are kept and
+examined whenever a shell or evaluator (bash, sh, zsh, dash, ksh, fish, pwsh, powershell,
+cmd, eval, source, `.`, xargs, in any path/.exe form, including behind env/sudo/timeout)
+appears among the line's words outside the bodies (`bash <<'EOF'`, `cat <<EOF | sh`,
+`source /dev/stdin <<EOF`, `bash -c "$(cat <<EOF ...)"`); the decision carries into nested
+levels. Consequence: a line that both runs a shell and commits with a heredoc message is
+examined in full (over-match). Out of scope: non-shell interpreters (`python3 - <<EOF`,
+`python -c "os.system('git push')"`, node, perl, ruby).

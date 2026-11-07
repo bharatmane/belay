@@ -248,6 +248,29 @@ class TestHeredocs(HookBase):
             with self.subTest(cmd=cmd):
                 self.assertDeny(self.bash(cmd), HUMAN)
 
+    def test_heredoc_fed_to_a_shell_is_examined(self):
+        for cmd in ("bash <<'EOF'\ngit push --force\nEOF\n", "sh <<EOF\ngh pr merge 5\nEOF",
+                    "cat <<'EOF' | bash\ngh pr merge 5\nEOF", "bash -s <<'EOF'\ngh pr merge 5\nEOF",
+                    "/bin/bash <<'EOF'\ngh pr merge 5\nEOF", "sudo zsh <<'EOF'\ngh pr merge 5\nEOF",
+                    "pwsh.exe -Command - <<'EOF'\ngh pr merge 5\nEOF",
+                    "source /dev/stdin <<'EOF'\ngh pr merge 5\nEOF",
+                    ". /dev/stdin <<'EOF'\ngh pr merge 5\nEOF",
+                    "xargs -I{} sh -c {} <<'EOF'\ngh pr merge 5\nEOF",
+                    "cat <<'EOF' | env timeout 5 dash\ngit push -f\nEOF",
+                    "bash -c \"$(cat <<'EOF'\ngh pr merge 5\nEOF\n)\"",
+                    "C:\\Program Files\\Git\\bin\\bash.exe <<'EOF'\ngh pr merge 5\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertDeny(self.bash(cmd), HUMAN)
+
+    def test_heredoc_into_python_allowed(self):
+        # python is not a shell: python -c "os.system('git push')" style bypasses are out of scope
+        self.assertAllow(self.bash("python3 - <<EOF\nprint('gh pr merge 5')\nEOF"))
+        self.assertAllow(self.bash("python3 - <<'EOF'\nimport os\n# git push --force\nEOF"))
+
+    def test_shell_word_inside_message_body_does_not_keep_body(self):
+        self.assertAllow(self.bash("git commit -m \"$(cat <<'EOF'\nrun bash, then gh pr merge\n"
+                                   "EOF\n)\""))
+
     def test_heredoc_commit_denied_under_stop(self):
         self.stop()
         self.assertDeny(self.bash(COMMIT_MERGE), "STOP")

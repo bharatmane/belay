@@ -23,7 +23,12 @@ removed, so g"it" p'u'sh is git push) and split into segments on ; & | ( ) < > n
 backtick. In each segment EVERY token whose basename is git/gh is examined, not just the first
 word, so wrappers (sudo, env, timeout, xargs, VAR=x) are covered. Heredoc bodies are removed
 first (they are data, e.g. a commit message in `$(cat <<'EOF' ... EOF)`); an unquoted-delimiter
-body keeps its $(...)/backtick substitutions, which do execute. Git global options (-C, -c,
+body keeps its $(...)/backtick substitutions, which do execute. Bodies are KEPT and examined
+when a shell or evaluator (bash, sh, zsh, dash, ksh, fish, pwsh, powershell, cmd, eval, source,
+`.`, xargs, any path/.exe form, also behind env/sudo/timeout) appears among the line's words
+outside the bodies, since the body may then run (`bash <<EOF`, `cat <<EOF | sh`). Interpreters
+are not shells: `python3 - <<EOF` bodies and `python -c "os.system('git push')"` are out of
+scope. Git global options (-C, -c,
 --git-dir ...) are skipped to find the subcommand. Quoted text is re-examined when it holds a
 command substitution ($( or backtick) or the segment calls a shell (bash -c, sh -c, eval, cmd,
 pwsh, Invoke-Expression ...). It over-matches on purpose (`echo git push` is denied under STOP).
@@ -57,6 +62,8 @@ GH_ISSUE_MUTATING = {"create", "edit", "comment", "close", "reopen", "delete", "
 GH_OPTS_WITH_ARG = {"-R", "--repo", "--hostname"}
 SHELL_INVOKERS = {"bash", "sh", "zsh", "dash", "ksh", "fish", "eval", "cmd", "pwsh",
                   "powershell", "invoke-expression", "iex", "su", "busybox"}
+# Words that make a heredoc body executable when they appear on the same command line.
+HEREDOC_CONSUMERS = SHELL_INVOKERS | {"source", ".", "xargs"}
 _PUNCT = ";&|()<>\n`"
 _MAX_DEPTH = 4
 
@@ -302,12 +309,25 @@ def _classify_gh(args: list[str]) -> tuple[bool, bool]:
     return False, False
 
 
-def classify_command(cmd: str, depth: int = 0) -> tuple[bool, bool]:
-    """(human_only, mutating) for a Bash/PowerShell command line."""
+def _has_input_consumer(cmd: str) -> bool:
+    return any(_prog(t) in HEREDOC_CONSUMERS for toks in _token_lists(cmd) for t in toks)
+
+
+def classify_command(cmd: str, depth: int = 0, keep_heredocs: bool = False) -> tuple[bool, bool]:
+    """(human_only, mutating) for a Bash/PowerShell command line.
+
+    Heredoc bodies are dropped (they are data, e.g. a commit message) unless a shell or
+    evaluator appears among the line's words outside the bodies (bash <<EOF, cat <<EOF | sh,
+    source /dev/stdin <<EOF ...): then the bodies may be executed and are examined, at this
+    level and in every nested $(...) / bash -c level below it.
+    """
     human = mutating = False
     if depth > _MAX_DEPTH:
         return False, True  # absurd nesting: mutating (denied under STOP/budget), not human-only
-    cmd = strip_heredocs(cmd)
+    stripped = strip_heredocs(cmd)
+    keep_heredocs = keep_heredocs or _has_input_consumer(stripped)
+    if not keep_heredocs:
+        cmd = stripped
     segs = [seg for toks in _token_lists(cmd) for seg in _segments(toks)]
     # A shell anywhere in the line (bash -c '...', echo '...' | sh) makes quoted text suspect.
     shell_call = any(_prog(t) in SHELL_INVOKERS for seg in segs for t in seg)
@@ -320,10 +340,11 @@ def classify_command(cmd: str, depth: int = 0) -> tuple[bool, bool]:
         for t in seg:
             if "$(" in t or "`" in t or (shell_call and re.search(r"\s", t)):
                 inner = t.replace("$(", ";").replace("`", ";").replace(")", ";")
-                h, m = classify_command(inner, depth + 1)
+                h, m = classify_command(inner, depth + 1, keep_heredocs)
                 human, mutating = human or h, mutating or m
         if any(p in SHELL_INVOKERS for p in progs):
-            h, m = classify_command(" ".join(seg[1:]), depth + 1) if len(seg) > 1 else (False, False)
+            h, m = (classify_command(" ".join(seg[1:]), depth + 1, keep_heredocs)
+                    if len(seg) > 1 else (False, False))
             human, mutating = human or h, mutating or m
     return human, mutating
 
