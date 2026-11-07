@@ -446,3 +446,154 @@ def resume(store: RunStore, cfg: Config, run_id: str, now: datetime) -> dict:
         _transition(run, "working", now, "resumed")
         store.save(run)
         return run
+
+
+# ---------------------------------------------------------------------------
+# Evidence, hand-off, high-risk paths, owner override
+# ---------------------------------------------------------------------------
+
+
+def record_evidence(store: RunStore, run_id: str, *, command: str, exit_code: int, head: str,
+                    stage: str, now: datetime) -> dict:
+    """Append a test-run record (command, exit code, commit) to the run's evidence list."""
+    if not isinstance(command, str) or not command.strip():
+        raise BelayRefusal(2, "evidence command must be a non-empty string")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        raise BelayRefusal(2, "evidence exit_code must be an integer")
+    if not isinstance(head, str) or not head.strip():
+        raise BelayRefusal(2, "evidence head (commit) must be a non-empty string")
+    now = _parse_iso(_iso(now))
+    with store.lock():
+        run = _load_for_update(store, run_id)
+        ev = run.setdefault("evidence", [])
+        if not isinstance(ev, list):
+            raise BelayRefusal(2, f"corrupt run record {run_id}: evidence is not a list")
+        ev.append({"command": command, "exit_code": exit_code, "head": head,
+                   "stage": str(stage), "at": _iso(now)})
+        store.save(run)
+        return run
+
+
+def hand_off(store: RunStore, cfg: Config, run_id: str, head: str, now: datetime) -> dict:
+    """Move a working run to `review`. Needs passing evidence recorded for exactly `head`.
+
+    Evidence counts only if its head equals `head`, exit_code == 0 and, when cfg.test_command is
+    set, its command equals cfg.test_command. So a new commit, or a different command, needs
+    fresh evidence (code 7). A run that is not `working` is code 6.
+    """
+    now = _parse_iso(_iso(now))
+    with store.lock():
+        run = _load_for_update(store, run_id)
+        if run.get("state") != "working":
+            raise BelayRefusal(6, f"cannot hand off: run {run_id} is {run.get('state')}, not working")
+        ev = run.get("evidence", [])
+        if not isinstance(ev, list):
+            raise BelayRefusal(2, f"corrupt run record {run_id}: evidence is not a list")
+        ok = any(isinstance(e, dict) and e.get("head") == head and e.get("exit_code") == 0
+                 and not isinstance(e.get("exit_code"), bool)
+                 and (not cfg.test_command or e.get("command") == cfg.test_command)
+                 for e in ev)
+        if not ok:
+            want = f" with command {cfg.test_command!r}" if cfg.test_command else ""
+            raise BelayRefusal(7, f"no passing evidence{want} for HEAD {head}; run the tests on "
+                                  "this commit and record the result before handing off")
+        _credit(cfg, run, now)
+        _transition(run, "review", now, f"handed off at {head}")
+        store.save(run)
+        return run
+
+
+def _norm_path(p: str) -> str:
+    p = str(p).replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+_GLOB_CACHE: dict[str, re.Pattern] = {}
+
+
+def _glob_regex(pattern: str) -> re.Pattern:
+    pat = _norm_path(pattern)
+    if pat.endswith("/"):
+        pat += "**"
+    rx = _GLOB_CACHE.get(pat)
+    if rx is not None:
+        return rx
+    out, i = [], 0
+    while i < len(pat):
+        c = pat[i]
+        if pat.startswith("**", i):
+            j = i + 2
+            while j < len(pat) and pat[j] == "*":
+                j += 1
+            if pat.startswith("/", j) and (i == 0 or pat[i - 1] == "/"):
+                out.append("(?:.*/)?")  # `**/` spans zero or more directories
+                i = j + 1
+            else:
+                out.append(".*")
+                i = j
+        elif c == "*":
+            out.append("[^/]*")
+            i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    rx = _GLOB_CACHE[pat] = re.compile("".join(out))
+    return rx
+
+
+def matches_glob(path: str, pattern: str) -> bool:
+    """Glob match on `/`-normalised paths (backslash becomes `/`, leading `./` dropped).
+
+    `**` spans directories (`**/x` also matches a top-level `x`); `*` and `?` never cross `/`;
+    a trailing `/` means the whole directory. Own implementation, not fnmatch (its `*` crosses
+    `/`). Matching is case-SENSITIVE on every platform, so a risky pattern is never silently
+    skipped by case; write patterns in the repo's own case.
+    """
+    if not pattern:
+        return False
+    return _glob_regex(pattern).fullmatch(_norm_path(path)) is not None
+
+
+def check_paths(cfg: Config, changed: Sequence[str], labels: Sequence[str]) -> None:
+    """Refuse (code 8) when a changed path matches cfg.high_risk_paths and the issue lacks the approved label."""
+    if cfg.labels["approved"] in labels:
+        return
+    hits = [_norm_path(p) for p in changed
+            if any(matches_glob(p, pat) for pat in cfg.high_risk_paths)]
+    if hits:
+        raise BelayRefusal(8, f"high-risk paths changed without label {cfg.labels['approved']!r}: "
+                              + ", ".join(hits))
+
+
+def override(store: RunStore, cfg: Config, run_id: str, *, who: str, kind: str, reason: str,
+             minutes: int = 0, now: datetime) -> dict:
+    """Owner-only: `extend` adds budget minutes, `reopen` moves a `failed` run back to `working`."""
+    if not cfg.owner:
+        raise BelayRefusal(9, "no owner configured: set `owner` in .belay.toml to allow overrides")
+    if who != cfg.owner:
+        raise BelayRefusal(9, f"{who!r} is not the owner ({cfg.owner!r}); only the owner may override")
+    if kind not in ("extend", "reopen"):
+        raise BelayRefusal(2, f"unknown override kind {kind!r}: use extend or reopen")
+    if kind == "extend" and (isinstance(minutes, bool) or not isinstance(minutes, int) or minutes <= 0):
+        raise BelayRefusal(2, "extend requires minutes > 0")
+    now = _parse_iso(_iso(now))
+    with store.lock():
+        run = _load_for_update(store, run_id)
+        if kind == "reopen":
+            if run.get("state") != "failed":
+                raise BelayRefusal(6, f"cannot reopen: run {run_id} is {run.get('state')}, not failed")
+            _credit(cfg, run, now)  # failed: moves ticks only, so the downtime is not credited
+            _transition(run, "working", now, f"reopened by {who}: {reason}")
+        else:
+            run["extension_minutes"] = _num(run, "extension_minutes", 0) + minutes
+        ovs = run.setdefault("overrides", [])
+        if not isinstance(ovs, list):
+            raise BelayRefusal(2, f"corrupt run record {run_id}: overrides is not a list")
+        ovs.append({"who": who, "kind": kind, "reason": reason, "at": _iso(now)})
+        store.save(run)
+        return run
