@@ -7,12 +7,14 @@ means "all defaults", which is a safe but limited setup (no owner, so no overrid
 ## Where the file is found
 
 The helper uses `<root>/.belay.toml`, where `<root>` is `--root` if given, otherwise the
-git top-level of the current directory, otherwise the current directory. `--config <path>`
-replaces the whole path. The hook always reads `<root>/.belay.toml` for the root that holds
-`.belay/`.
+main checkout of the current repository (so a linked worktree shares the main checkout's
+file), otherwise the current directory. `--config <path>` replaces the whole path. The hook
+reads `<root>/.belay.toml` for the root that holds `.belay/`, resolving a linked worktree
+the same way. Details and limits are in [safety](safety.md#hook-and-helper-limits).
 
 Add `.belay/` to `.gitignore`. It holds run records, the stop file and scratch files that
-must never be committed.
+must never be committed; skills check with `git check-ignore -q .belay` and stop if it is
+not ignored.
 
 ## How the file is checked
 
@@ -64,8 +66,9 @@ these keys yet.
 
 ### `[labels]`
 
-Tracker label names for each state. Each value must be a non-blank string. The helper
-compares names exactly, including case, so spell them as they appear on the tracker.
+Tracker label names for each state. Each value must be a non-blank string. Like GitHub,
+the helper matches the stop and approved labels ignoring case and surrounding spaces, so
+`Belay:Stop` on the issue counts as `belay:stop`.
 
 | Key | Default | Set by | Meaning |
 |---|---|---|---|
@@ -81,10 +84,14 @@ compares names exactly, including case, so spell them as they appear on the trac
 
 | Key | Type | Default | Rule | Read by | Meaning |
 |---|---|---|---|---|---|
-| `budget.active_minutes` | integer | `90` | `> 0` | helper, hook | Working minutes per run, plus any owner extensions. Time in `waiting` does not count. When spent, `heartbeat` exits 4 and the hook denies mutating tool calls. |
+| `budget.active_minutes` | integer | `90` | `> 0` | helper, hook | Working minutes per run, plus any owner extensions. Time in `waiting` does not count. When spent, `heartbeat` exits 4 and the hook denies mutating tool calls (the hook sees the active time recorded at the last `heartbeat`). An owner `extend` adds minutes here only; it never adds attempts. |
 | `budget.attempts_per_stage` | integer | `3` | `> 0` | helper (`attempt`) | Tries allowed per named stage; the next `attempt` exits 4. |
 
 ## `high_risk_paths` globs
+
+Patterns are relative to the repository root. Feed `check-paths` repo-relative paths: run
+`git diff --name-only <base_branch>...HEAD` in the worktree and pass its output with
+`--changed -`. Absolute paths cannot be resolved reliably.
 
 Paths and patterns are compared after normalising: `\` becomes `/`, a leading `./` or `/`
 and a drive letter are dropped, `..` is resolved.
