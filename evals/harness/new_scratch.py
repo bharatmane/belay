@@ -27,7 +27,8 @@ def main(argv):
     (scratch / ".gitignore").write_text(".belay/
 .fake-gh/
 ", encoding="utf-8")
-    (scratch / ".belay.toml").write_text('tracker = "github"
+    (scratch / ".belay.toml").write_text(
+        'tracker = "github"
 
 [github]
 repo = "example/fake"
