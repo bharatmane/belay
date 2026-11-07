@@ -1,0 +1,18 @@
+{
+  "description": "Belay guard: deny file edits, commits, pushes and tracker changes while .belay/STOP exists or a Belay run is over budget; never merge, approve or force-push. Fails open.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/belay_hook.py\" || python \"${CLAUDE_PLUGIN_ROOT}/scripts/belay_hook.py\"",
+            "timeout": 30,
+            "onFailure": "continue"
+          }
+        ]
+      }
+    ]
+  }
+}

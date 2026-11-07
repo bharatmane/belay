@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -99,6 +101,29 @@ class RepoTests(unittest.TestCase):
         errs = v.validate_links(self.root)
         self.assertEqual(len(errs), 1)
         self.assertIn("missing.md", errs[0])
+
+    def test_hooks_json_checked_when_present(self):
+        self.assertEqual(v.validate_hooks(self.root), [])  # absent is fine
+        (self.root / "hooks").mkdir()
+        (self.root / "hooks" / "hooks.json").write_text("{bad", encoding="utf-8")
+        self.assertTrue(any("hooks.json" in e for e in v.validate_hooks(self.root)))
+        (self.root / "hooks" / "hooks.json").write_text('{"PreToolUse": []}', encoding="utf-8")
+        self.assertTrue(any("hooks" in e for e in v.validate_hooks(self.root)))
+        (self.root / "hooks" / "hooks.json").write_text('{"hooks": {"PreToolUse": []}}',
+                                                       encoding="utf-8")
+        self.assertEqual(v.validate_hooks(self.root), [])
+
+    def test_real_repo_hooks_json_valid(self):
+        self.assertEqual(v.validate_hooks(Path(__file__).resolve().parent.parent), [])
+
+    def test_main_reports_bad_hooks_json(self):
+        make_manifests(self.root)
+        (self.root / "hooks").mkdir()
+        (self.root / "hooks" / "hooks.json").write_text("{bad", encoding="utf-8")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(v.main([str(self.root)]), 1)
+        self.assertIn("hooks.json", out.getvalue())
 
     def test_main_ok_and_failure(self):
         make_manifests(self.root)

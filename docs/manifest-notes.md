@@ -68,3 +68,85 @@ accept only `name`, `description`, `license`, `compatibility`, `metadata`,
 
 Consequence for Task 10: `dispatch/SKILL.md` must carry
 `disable-model-invocation: true`.
+
+## Hooks (`hooks/hooks.json`)
+
+Verified 2026-11-07 against `code.claude.com/docs/en/hooks` (hooks reference) and
+`code.claude.com/docs/en/plugins-reference` (standard layout, environment variables).
+Limitation: the hooks page (~290,000 characters) was read through a summarising fetch in
+three windows; the facts below were quoted from it directly.
+
+- Location: `hooks/hooks.json` at the plugin root is loaded by default (no manifest key
+  needed; a `hooks` manifest key would merge with it). The file wraps the event map in a
+  top-level `"hooks"` key (a file without the wrapper fails to load) and may carry a
+  top-level `description`.
+- Shape: `{"hooks": {"PreToolUse": [{"matcher": "...", "hooks": [{"type": "command",
+  "command": "...", "args": [...], "timeout": <seconds>, "shell": "bash"|"powershell",
+  "onFailure": "continue"|"block"}]}]}}`. Default command timeout 600 s.
+- Matcher: a string of only letters, digits, `_`, `-`, spaces, `,` and `|` is an exact
+  name or a `|`/`,` list (`Edit|Write`); any other character makes it an unanchored
+  JavaScript regex. Belay uses the exact list
+  `Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell` (PowerShell is the Windows shell tool).
+- PreToolUse stdin: common fields (`session_id`, `transcript_path`, `cwd`,
+  `permission_mode`, `hook_event_name`, ...) plus `tool_name`, `tool_input`, `tool_use_id`.
+  `tool_input`: Bash `command`; Write `file_path`, `content`; Edit `file_path`,
+  `old_string`, `new_string`, `replace_all`. MultiEdit uses `file_path` and NotebookEdit
+  `notebook_path` (not shown in the fetched text; the hook accepts either key).
+- Deny: exit 0 and print
+  `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+  "permissionDecisionReason": "..."}}`. Exit 2 with stderr also blocks, but JSON gives finer
+  control and the docs say to pick one approach per hook; belay uses JSON and always exits 0.
+  Top-level `decision`/`reason` are deprecated for PreToolUse. Printing nothing means no
+  decision (normal permission flow); the hook never prints `"allow"`, which would skip the
+  user's permission prompts.
+- Exit codes: 0 success (JSON applied), 2 blocking error (stderr is the reason), anything
+  else non-blocking error (action goes ahead, transcript notice).
+- Failure (cannot start, other exit code, timeout, unparsable JSON): the action goes ahead
+  unless `"onFailure": "block"` (v2.1.295+). Exception: on Windows WITHOUT Git Bash a
+  shell-form PreToolUse hook that fails with `onFailure` unset can block the tool call.
+  Belay sets `"onFailure": "continue"` so a broken or missing interpreter never blocks.
+- `${CLAUDE_PLUGIN_ROOT}`: absolute path of the installed plugin version, substituted
+  anywhere in `command` and `args` and exported to the hook process. Windows paths use
+  forward slashes, except in exec form and PowerShell-run hooks.
+- Exec form (`args` present: no shell, recommended for path placeholders) vs shell form
+  (`args` absent: `sh -c` on macOS/Linux, Git Bash on Windows, PowerShell when Git Bash is
+  missing - `pwsh.exe` if present, else `powershell.exe` 5.1). In shell form each
+  placeholder must sit in double quotes.
+
+### Interpreter choice (`python3` vs `python`)
+
+No single name works everywhere: macOS and many Linux distributions ship only `python3`;
+the python.org Windows installer provides `python` (and `py`) but no `python3`, and
+Windows' `python3` is often the Microsoft Store stub that exits 9009. Exec form can name
+only one executable, so belay uses shell form with a fallback:
+
+    python3 "${CLAUDE_PLUGIN_ROOT}/scripts/belay_hook.py" || python "${CLAUDE_PLUGIN_ROOT}/scripts/belay_hook.py"
+
+This is safe because the hook always exits 0 (deny travels as JSON), so the fallback runs
+only when `python3` could not start, before it read stdin. Tradeoffs: a missing `python3`
+prints a "command not found" line on stderr (non-blocking); if `python3` is older than 3.11
+the hook fails open with one stderr line instead of trying `python`; on Windows without Git
+Bash under Windows PowerShell 5.1 the `||` operator does not parse, so the hook fails and
+`onFailure: continue` lets the call through (no enforcement there; PowerShell 7 parses `||`).
+
+### What the hook enforces (Task 6b)
+
+Only when `<root>/.belay/` exists, root = first ancestor of `cwd` (and of an edited file)
+holding `.belay/`, never above a directory holding `.git`:
+always deny `gh pr merge`, `gh pr review --approve`/`-a`, `gh api` merge or APPROVE calls and
+force pushes (`--force`, `-f` in a short-flag cluster, `--force-with-lease`, `+refspec`);
+while `.belay/STOP` exists or a `working` run has spent its budget, deny Edit/Write/
+MultiEdit/NotebookEdit outside `.belay/` and shell commands running git
+commit/push/merge/rebase/pull/cherry-pick/revert/am, gh pr
+create/merge/review/edit/comment/close/reopen/ready, gh issue
+create/edit/comment/close/reopen/delete/transfer/lock/unlock/pin/unpin/develop, or a
+mutating `gh api` call. Any internal error fails open with one stderr line.
+
+Known matcher limits (guardrail, not a sandbox): git/gh aliases; commands assembled from
+variables (`$G push`); scripts, Makefiles or interpreters (`python -c`) that run git; other
+clients (hub, curl to the API, MCP tools such as a GitHub MCP server); shell file writes
+(`echo > f`, `sed -i`) are not file-tool calls; edits and writes under `.belay/` are always
+allowed (so the owner can clear STOP), which also means run records there are writable; a
+corrupt run record or bad config fails open, disabling the budget check (STOP still works).
+Over-matching is deliberate: `echo git push` or a commit message mentioning `gh pr merge`
+inside `bash -c '...'` is denied.

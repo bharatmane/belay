@@ -117,6 +117,18 @@ def validate_manifest(root: Path) -> list[str]:
     return errors
 
 
+def validate_hooks(root: Path) -> list[str]:
+    """If hooks/hooks.json exists it must be JSON with the event map under a top-level "hooks"."""
+    path = root / "hooks" / "hooks.json"
+    if not path.is_file():
+        return []
+    errors: list[str] = []
+    data = _load_json(path, errors)
+    if data is not None and not (isinstance(data, dict) and isinstance(data.get("hooks"), dict)):
+        errors.append("hooks.json: the event map must sit under a top-level \"hooks\" object")
+    return errors
+
+
 def validate_links(root: Path) -> list[str]:
     errors: list[str] = []
     for md in sorted(root.rglob("*.md")):
@@ -140,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     root = Path(args[0]) if args else Path(__file__).resolve().parent.parent
     errors = validate_manifest(root)
+    errors.extend(validate_hooks(root))
     skills = root / "skills"
     if skills.is_dir():
         for d in sorted(p for p in skills.iterdir() if p.is_dir()):
