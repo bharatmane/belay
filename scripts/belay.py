@@ -335,3 +335,86 @@ def claim(store: RunStore, cfg: Config, issue: str, now: datetime,
             run.setdefault("history", []).append("stale")
             store.save(run)
         return resumed if resumed is not None else store.create(issue, cfg.tracker, now)
+
+
+# ---------------------------------------------------------------------------
+# Active time, budget, attempts, wait and resume
+# ---------------------------------------------------------------------------
+
+
+def _load_for_update(store: RunStore, run_id: str) -> dict:
+    """Load a run inside store.lock(); an absent record is code 6 (corrupt stays code 2)."""
+    if not store._path(run_id).exists():
+        raise BelayRefusal(6, f"run not found: {run_id}")
+    return store.load(run_id)
+
+
+def _credit(cfg: Config, run: dict, now: datetime) -> None:
+    """Credit working time since last_tick (capped at idle_minutes, never negative); move ticks."""
+    if run.get("state") == "working":
+        gap = (now - _parse_iso(run["last_tick"])).total_seconds()
+        run["active_seconds"] = run.get("active_seconds", 0) + min(max(gap, 0), cfg.idle_minutes * 60)
+    run["last_tick"] = run["heartbeat"] = _iso(now)
+
+
+def _transition(run: dict, to: str, now: datetime, note: str) -> None:
+    run.setdefault("history", []).append(
+        {"from": run["state"], "to": to, "at": _iso(now), "note": note})
+    run["state"] = to
+
+
+def budget(cfg: Config, run: dict, now: datetime) -> dict:
+    limit = cfg.active_minutes + run.get("extension_minutes", 0)
+    active = run.get("active_seconds", 0) / 60
+    return {"active_minutes": active, "limit_minutes": limit,
+            "remaining_minutes": max(limit - active, 0),
+            "attempts": dict(run.get("attempts", {})), "spent": active >= limit}
+
+
+def heartbeat(store: RunStore, cfg: Config, run_id: str, now: datetime) -> dict:
+    now = _parse_iso(_iso(now))
+    with store.lock():
+        run = _load_for_update(store, run_id)
+        _credit(cfg, run, now)
+        store.save(run)
+    bd = budget(cfg, run, now)
+    if bd["spent"]:
+        raise BelayRefusal(4, f"budget spent: {bd['active_minutes']:.1f} of {bd['limit_minutes']} "
+                              f"active minutes used for run {run_id}")
+    return run
+
+
+def attempt(store: RunStore, cfg: Config, run_id: str, stage: str, now: datetime) -> dict:
+    with store.lock():
+        run = _load_for_update(store, run_id)
+        attempts = run.setdefault("attempts", {})
+        if attempts.get(stage, 0) >= cfg.attempts_per_stage:
+            raise BelayRefusal(4, f"attempts spent for stage {stage!r}: "
+                                  f"{cfg.attempts_per_stage} allowed")
+        attempts[stage] = attempts.get(stage, 0) + 1
+        store.save(run)
+        return run
+
+
+def wait(store: RunStore, cfg: Config, run_id: str, reason: str, now: datetime) -> dict:
+    now = _parse_iso(_iso(now))
+    with store.lock():
+        run = _load_for_update(store, run_id)
+        if run.get("state") != "working":
+            raise BelayRefusal(6, f"cannot wait: run {run_id} is {run.get('state')}, not working")
+        _credit(cfg, run, now)
+        _transition(run, "waiting", now, reason)
+        store.save(run)
+        return run
+
+
+def resume(store: RunStore, cfg: Config, run_id: str, now: datetime) -> dict:
+    now = _parse_iso(_iso(now))
+    with store.lock():
+        run = _load_for_update(store, run_id)
+        if run.get("state") != "waiting":
+            raise BelayRefusal(6, f"cannot resume: run {run_id} is {run.get('state')}, not waiting")
+        _credit(cfg, run, now)  # waiting: moves ticks only, credits nothing
+        _transition(run, "working", now, "resumed")
+        store.save(run)
+        return run
