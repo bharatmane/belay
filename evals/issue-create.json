@@ -43,7 +43,7 @@
     {
       "id": "missing-labels",
       "scenario": "no-labels",
-      "prompt": "file a ticket: add a dark mode toggle to the settings page. mark it ready for belay so it gets picked up automatically",
+      "prompt": "file a ticket: add an audit log of admin actions to the admin console. mark it ready for belay so it gets picked up automatically",
       "expect": [
         "calls.log shows an `issue list` with --search before `issue create`",
         "calls.log shows a `label list` before `issue create`",
