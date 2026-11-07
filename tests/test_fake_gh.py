@@ -138,7 +138,7 @@ class Misc(FakeGhCase):
 
     def test_auth_status_ok_pr_unsupported_unknown_exit_1(self):
         self.gh("auth", "status")
-        self.assertIn("not supported", self.gh("pr", "list", expect=1).stderr)
+        self.assertIn("not supported", self.gh("pr", "checkout", "7", expect=1).stderr)
         p = self.gh("repo", "delete", expect=1)
         self.assertIn("fake gh: unsupported command: repo delete", p.stderr)
 
@@ -180,6 +180,110 @@ class Scenarios(unittest.TestCase):
     def test_default_has_belay_labels(self):
         names = [x["name"] for x in self.run_scenario("default")["labels"]]
         self.assertIn("belay:ready", names)
+
+
+class PrCommands(FakeGhCase):
+    scenario = "pr-bug-nit-preexisting"
+
+    def test_pr_view_fields(self):
+        fields = ("number,title,body,state,isDraft,author,baseRefName,headRefName,headRefOid,baseRefOid,files,"
+                  "additions,deletions,commits,reviews,comments,statusCheckRollup,url,mergeable,reviewDecision")
+        v = self.js("pr", "view", "7", "-R", "o/r", "--json", fields)
+        self.assertEqual(v["number"], 7)
+        self.assertIs(v["isDraft"], False)
+        self.assertEqual(v["author"]["login"], "dev-sam")
+        self.assertEqual(v["headRefName"], "pr-7-fix-login")
+        self.assertEqual({f["path"] for f in v["files"]}, {"auth/login.py", "tests/test_login.py"})
+        self.assertTrue(v["url"].endswith("/pull/7"))
+        self.gh("pr", "view", "99", "--json", "number", expect=1)
+
+    def test_pr_diff_and_name_only(self):
+        d = self.gh("pr", "diff", "7").stdout
+        self.assertIn("+++ b/auth/login.py", d)
+        self.assertIn("+        return None", d)
+        self.assertEqual(self.gh("pr", "diff", "7", "--name-only").stdout.split(), ["auth/login.py", "tests/test_login.py"])
+
+    def test_pr_list_and_checks(self):
+        self.assertEqual([r["number"] for r in self.js("pr", "list", "--state", "open", "--json", "number")], [7])
+        out = self.gh("pr", "checks", "7").stdout
+        self.assertIn("ci/test", out)
+        self.assertIn("pass", out)
+
+    def test_failing_checks_exit_1(self):
+        self.gh("pr", "list", "--json", "number")
+        st = json.loads(self.state.read_text(encoding="utf-8"))
+        st["prs"][0]["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+        self.state.write_text(json.dumps(st), encoding="utf-8")
+        self.gh("pr", "checks", "7", expect=1)
+
+    def test_graphql_review_threads_empty_without_review(self):
+        out = self.js("api", "graphql", "-f", "query=query{x}", "-F", "number=7")
+        nodes = out["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+        self.assertEqual(nodes, [])
+
+    def test_writes_are_logged_and_blocked(self):
+        for sub in ("review", "comment", "merge", "close", "ready", "edit", "create"):
+            p = self.gh("pr", sub, "7", "--approve", expect=1)
+            self.assertIn("fake gh: write blocked", p.stderr)
+        calls = [json.loads(x)["argv"][:2] for x in (self.state.parent / "calls.log").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([c[1] for c in calls], ["review", "comment", "merge", "close", "ready", "edit", "create"])
+        st = json.loads(self.state.read_text(encoding="utf-8")) if self.state.exists() else {}
+        self.assertEqual(st.get("prs", [{}])[0].get("state", "OPEN"), "OPEN")
+
+
+class PrScenarios(FakeGhCase):
+    def prs(self, name):
+        self.env["BELAY_FAKE_GH_SCENARIO"] = name
+        return {r["number"]: r for r in self.js("pr", "list", "--state", "all",
+                                                "--json", "number,isDraft,body,reviews,title,additions,deletions")}
+
+    def test_draft_trivial(self):
+        prs = self.prs("pr-draft-trivial")
+        self.assertIs(prs[8]["isDraft"], True)
+        self.assertIs(prs[9]["isDraft"], False)
+        self.assertEqual((prs[9]["additions"], prs[9]["deletions"]), (1, 1))
+
+    def test_already_reviewed_has_marker_thread_at_head(self):
+        self.prs("pr-already-reviewed")
+        head = self.js("pr", "view", "7", "--json", "headRefOid")["headRefOid"]
+        out = self.js("api", "graphql", "-F", "number=7")
+        node = out["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"][0]
+        self.assertIn(f"<!-- belay:review=7@{head} -->", node["comments"]["nodes"][0]["body"])
+
+    def test_injection_in_body_and_diff(self):
+        prs = self.prs("pr-injection")
+        self.assertIn("AI reviewers", prs[7]["body"])
+        self.assertIn("AI reviewers", self.gh("pr", "diff", "7").stdout)
+
+
+class PrScratchRepo(unittest.TestCase):
+    def test_head_sha_is_checkoutable_for_each_scenario(self):
+        import shutil
+        if shutil.which("git") is None:
+            self.skipTest("git not installed")
+        for name in ("pr-bug-nit-preexisting", "pr-draft-trivial", "pr-already-reviewed", "pr-injection"):
+            with self.subTest(name):
+                p = subprocess.run([sys.executable, str(HARNESS / "new_scratch.py"), name], capture_output=True, text=True)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                scratch = Path(p.stdout.splitlines()[0].split(": ", 1)[1].strip())
+                try:
+                    st = json.loads((scratch / ".fake-gh" / "state.json").read_text(encoding="utf-8"))
+                    for pr in st["prs"]:
+                        wt = scratch.parent / (scratch.name + f"-wt{pr['number']}")
+                        r = subprocess.run(["git", "worktree", "add", "--detach", str(wt), pr["headRefOid"]],
+                                           cwd=scratch, capture_output=True, text=True)
+                        self.assertEqual(r.returncode, 0, r.stderr)
+                        for path, content in pr["changes"].items():
+                            got = (wt / path).read_bytes().decode("utf-8").replace(chr(13) + chr(10), chr(10))
+                            self.assertEqual(got, content)
+                        subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=scratch,
+                                       capture_output=True)
+                        base = subprocess.run(["git", "rev-parse", "main"], cwd=scratch, capture_output=True, text=True)
+                        self.assertEqual(base.stdout.strip(), pr["baseRefOid"])
+                    wl = subprocess.run(["git", "worktree", "list"], cwd=scratch, capture_output=True, text=True)
+                    self.assertEqual(len(wl.stdout.strip().splitlines()), 1)
+                finally:
+                    shutil.rmtree(scratch, ignore_errors=True)
 
 
 class NewScratch(unittest.TestCase):

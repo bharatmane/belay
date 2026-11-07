@@ -12,6 +12,8 @@ import sys
 import time
 from pathlib import Path
 
+import pr_fixtures
+
 URL = "https://github.com/example/fake/issues/{}"
 LABELS = ["bug", "enhancement", "documentation"]
 BELAY = ["belay:ready", "belay:working", "belay:waiting", "belay:review", "belay:failed", "belay:stop"]
@@ -44,7 +46,8 @@ def seed(scenario):
     elif scenario == "no-labels":
         labels = LABELS
     return {"scenario": scenario, "login": "octocat", "issues": issues,
-            "labels": [{"name": n, "description": ""} for n in labels], "comments": [], "edits": []}
+            "labels": [{"name": n, "description": ""} for n in labels], "comments": [], "edits": [],
+            "prs": pr_fixtures.prs_for(scenario)}
 
 
 def state_path():
@@ -201,6 +204,76 @@ def issue_cmd(st, sub, pos, flags):
     return True
 
 
+PR_URL = "https://github.com/example/fake/pull/{}"
+PR_WRITES = {"review", "comment", "merge", "close", "ready", "edit", "create", "reopen"}
+
+
+def find_pr(st, n):
+    for p in st.get("prs", []):
+        if str(p["number"]) == str(n):
+            return p
+    fail(f"GraphQL: Could not resolve to a PullRequest with the number of {n}. (repository.pullRequest)")
+
+
+def pr_shape(pr, fields):
+    out = {}
+    for f in fields:
+        if f == "author":
+            out[f] = {"login": pr["author"]}
+        elif f == "url":
+            out[f] = PR_URL.format(pr["number"])
+        elif f in pr and f not in ("diff", "threads", "changes"):
+            out[f] = pr[f]
+        else:
+            fail(f'Unknown JSON field: "{f}"')
+    return out
+
+
+def checks_table(pr):
+    words = {"SUCCESS": "pass", "FAILURE": "fail", "PENDING": "pending", "SKIPPED": "skipping"}
+    rows = [(c["name"], words.get(c.get("conclusion") or "PENDING", "pending")) for c in pr["statusCheckRollup"]]
+    return rows
+
+
+def pr_cmd(st, sub, pos, flags, argv):
+    if sub in PR_WRITES:
+        fail("fake gh: write blocked")
+    if sub == "list":
+        state = flags.get("--state", ["open"])[0].upper()
+        rows = [pr_shape(p, fields_of(flags)) if fields_of(flags) else p for p in st.get("prs", [])
+                if state == "ALL" or p["state"] == state]
+        emit(rows[:int(flags.get("--limit", ["30"])[0])], flags)
+    elif sub == "view" and pos:
+        emit(pr_shape(find_pr(st, pos[0]), fields_of(flags)), flags)
+    elif sub == "diff" and pos:
+        pr = find_pr(st, pos[0])
+        if "--name-only" in argv:
+            print(chr(10).join(f["path"] for f in pr["files"]))
+        else:
+            print(pr["diff"], end="")
+    elif sub == "checks" and pos:
+        rows = checks_table(find_pr(st, pos[0]))
+        if not rows:
+            fail("no checks reported on the branch")
+        for name, word in rows:
+            print(f"{name}\t{word}\t1s\thttps://github.com/example/fake/actions/runs/1")
+        words = {w for _, w in rows}
+        sys.exit(1 if "fail" in words else 8 if "pending" in words else 0)
+    else:
+        fail("fake gh: not supported")
+    return True
+
+
+def threads_reply(st, argv):
+    """Review threads of the PR named by a `number=N` field; an empty list when none."""
+    nodes = []
+    for a in argv:
+        if a.startswith("number=") and a[7:].isdigit():
+            nodes = find_pr(st, a[7:]).get("threads", [])
+    return {"data": {"repository": {"pullRequest": {"reviewThreads": {
+        "nodes": nodes, "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}}
+
+
 def main(argv):
     path = state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -225,7 +298,10 @@ def main(argv):
         print("github.com\n  Logged in to github.com account octocat (fake)")
         ok = True
     elif cmd == "pr":
-        fail("fake gh: not supported")
+        ok = pr_cmd(st, sub, pos, flags, argv)
+    elif cmd == "api" and sub == "graphql":
+        print(json.dumps(threads_reply(st, argv)))
+        ok = True
     if not ok:
         fail("fake gh: unsupported command: " + " ".join(argv))
     save(path, st)
