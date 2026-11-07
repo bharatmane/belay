@@ -346,6 +346,13 @@ class TestBudget(HookBase):
         self.make_run(active_seconds=10_000, state="review")
         self.assertAllow(self.run_hook("Write", file_path=str(self.root / "a.py"), content=""))
 
+    def test_failed_run_unblocks_escape_hatch(self):
+        run = self.make_run(active_seconds=10_000)
+        self.assertDeny(self.bash("gh issue comment 1 -b x"))
+        b.fail(b.RunStore(self.root), b.Config(), run["run_id"], "budget spent", NOW)
+        self.assertAllow(self.bash("gh issue comment 1 -b x"))
+        self.assertAllow(self.bash("gh issue edit 1 --add-label belay:failed"))
+
     def test_extension_and_config_respected(self):
         run = self.make_run(active_seconds=95 * 60)
         run["extension_minutes"] = 30

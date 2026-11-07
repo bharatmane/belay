@@ -437,6 +437,27 @@ def wait(store: RunStore, cfg: Config, run_id: str, reason: str, now: datetime) 
         return run
 
 
+def fail(store: RunStore, cfg: Config, run_id: str, reason: str, now: datetime) -> dict:
+    """Mark a working or waiting run `failed` (the escape hatch when a run cannot continue).
+
+    Deliberately has NO stop-switch or budget gate: failing must always be possible, including
+    when the budget is spent. Working time is credited first so the record is accurate. Any other
+    state (failed, review, ...) is code 6; an empty reason is code 2.
+    """
+    if not isinstance(reason, str) or not reason.strip():
+        raise BelayRefusal(2, "fail requires a non-empty reason")
+    now = _parse_iso(_iso(now))
+    with store.lock():
+        run = _load_for_update(store, run_id)
+        if run.get("state") not in ("working", "waiting"):
+            raise BelayRefusal(6, f"cannot fail: run {run_id} is {run.get('state')}, "
+                                  "not working or waiting")
+        _credit(cfg, run, now)
+        _transition(run, "failed", now, reason.strip())
+        store.save(run)
+        return run
+
+
 def _check_no_other_working(store: RunStore, cfg: Config, run_id: str, now: datetime) -> None:
     """Code 5 if another run is `working` with a fresh heartbeat. Call while holding store.lock()."""
     for other in store.list_runs():
@@ -699,6 +720,8 @@ def _build_parser() -> argparse.ArgumentParser:
     sp = cmd("wait")
     sp.add_argument("--reason", required=True)
     cmd("resume")
+    sp = cmd("fail")
+    sp.add_argument("--reason", required=True)
     sp = cmd("evidence")
     sp.add_argument("--cmd", required=True, dest="command_line")
     sp.add_argument("--exit-code", required=True, type=int)
@@ -776,6 +799,8 @@ def _dispatch(args, root: Path, cfg: Config, store: RunStore, now: datetime) -> 
         return _run_summary(wait(store, cfg, args.run, args.reason, now))
     if c == "resume":
         return _run_summary(resume(store, cfg, args.run, now))
+    if c == "fail":
+        return _run_summary(fail(store, cfg, args.run, args.reason, now))
     if c == "evidence":
         return _run_summary(record_evidence(
             store, args.run, command=args.command_line, exit_code=args.exit_code,
