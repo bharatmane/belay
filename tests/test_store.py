@@ -1,7 +1,9 @@
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -155,6 +157,83 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([r for r in results if r[0] == "error"], [])
         self.assertEqual(sum(1 for r in results if r[0] == "ok"), 1)
         self.assertEqual([r[1] for r in results if r[0] == "refused"], [5] * 7)
+        self.assertEqual(len(self.store.list_runs()), 1)
+
+    def test_naive_now_does_not_look_corrupt(self):
+        b.claim(self.store, self.cfg, "1", NOW)
+        naive = datetime(2026, 1, 2, 3, 5, 5)
+        with self.assertRaises(b.BelayRefusal) as cm:
+            b.claim(self.store, self.cfg, "2", naive)
+        self.assertEqual(cm.exception.code, 5)
+        later = datetime(2026, 1, 2, 3, 4, 5) + timedelta(minutes=self.cfg.idle_minutes + 1)
+        self.assertEqual(b.claim(self.store, self.cfg, "1", later)["issue"], "1")
+
+    def test_unreadable_record_is_not_called_corrupt(self):
+        run = b.claim(self.store, self.cfg, "1", NOW)
+        path = self.store._path(run["run_id"])
+        real = Path.read_text
+
+        def deny(self_, *a, **k):
+            if self_ == path:
+                raise PermissionError("denied")
+            return real(self_, *a, **k)
+
+        with mock.patch.object(Path, "read_text", deny), mock.patch.object(b.time, "sleep"):
+            with self.assertRaises(b.BelayRefusal) as cm:
+                self.store.load(run["run_id"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("could not read", cm.exception.reason)
+        self.assertIn(path.name, cm.exception.reason)
+        self.assertNotIn("delete", cm.exception.reason)
+
+    def test_unsafe_run_id_rejected(self):
+        for bad in ("../x", "a/b", "", "a.b"):
+            with self.assertRaises(b.BelayRefusal) as cm:
+                self.store.load(bad)
+            self.assertEqual(cm.exception.code, 2)
+        with self.assertRaises(b.BelayRefusal) as cm:
+            self.store.save({"run_id": "../x"})
+        self.assertEqual(cm.exception.code, 2)
+        self.assertFalse((self.root / ".belay" / "x.json").exists())
+
+    def test_two_stale_working_runs_resume_same_issue_fail_other(self):
+        r1 = self.store.create("A", "github", NOW)
+        r2 = self.store.create("B", "github", NOW)
+        later = NOW + timedelta(minutes=self.cfg.idle_minutes + 1)
+        got = b.claim(self.store, self.cfg, "A", later)
+        self.assertEqual(got, r1)
+        self.assertEqual(self.store.load(r2["run_id"])["state"], "failed")
+        self.assertEqual(self.store.load(r1["run_id"])["state"], "working")
+
+    def test_fresh_working_run_blocks_even_with_stale_same_issue(self):
+        self.store.create("A", "github", NOW)
+        fresh = self.store.create("B", "github", NOW + timedelta(minutes=self.cfg.idle_minutes))
+        later = NOW + timedelta(minutes=self.cfg.idle_minutes + 1)
+        with self.assertRaises(b.BelayRefusal) as cm:
+            b.claim(self.store, self.cfg, "A", later)
+        self.assertEqual(cm.exception.code, 5)
+        self.assertEqual(self.store.load(fresh["run_id"])["state"], "working")
+
+    def test_cross_process_claims_only_one_wins(self):
+        script = """
+import sys, importlib.util
+from datetime import datetime, timezone
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('belay', sys.argv[1])
+m = importlib.util.module_from_spec(spec); sys.modules['belay'] = m
+spec.loader.exec_module(m)
+try:
+    m.claim(m.RunStore(Path(sys.argv[2])), m.Config(), sys.argv[3],
+            datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc))
+except m.BelayRefusal as e:
+    sys.exit(e.code)
+"""
+        belay_path = str(Path(b.__file__).resolve())
+        procs = [subprocess.Popen([sys.executable, "-I", "-c", script, belay_path, str(self.root), f"i{n}"],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                 for n in range(4)]
+        codes = sorted(p.wait(timeout=30) for p in procs)
+        self.assertEqual(codes, [0, 5, 5, 5])
         self.assertEqual(len(self.store.list_runs()), 1)
 
 

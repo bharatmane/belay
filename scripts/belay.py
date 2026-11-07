@@ -183,6 +183,9 @@ def _replace_with_retry(src: Path, dst: Path) -> None:
             time.sleep(0.02)
 
 
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+
 class RunStore:
     """Run records as `<root>/.belay/runs/<run_id>.json`.
 
@@ -201,6 +204,8 @@ class RunStore:
         self.lock_path = self.base / "lock"
 
     def _path(self, run_id: str) -> Path:
+        if not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id):
+            raise BelayRefusal(2, f"invalid run id {run_id!r}: only letters, digits, _ and - allowed")
         return self.runs_dir / f"{run_id}.json"
 
     def create(self, issue: str, tracker: str, now: datetime) -> dict:
@@ -218,11 +223,22 @@ class RunStore:
         return self._read(self._path(run_id))
 
     def _read(self, path: Path) -> dict:
+        text = None
+        for attempt in range(50):
+            try:
+                text = path.read_text(encoding="utf-8")
+                break
+            except FileNotFoundError:
+                raise BelayRefusal(2, f"run record not found: {path}") from None
+            except UnicodeDecodeError as e:
+                raise BelayRefusal(2, f"corrupt run record {path}: {e}; repair or delete this file") from None
+            except OSError as e:
+                if attempt == 49:
+                    raise BelayRefusal(2, f"could not read {path}: {e}") from None
+                time.sleep(0.02)
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            raise BelayRefusal(2, f"run record not found: {path}") from None
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
             raise BelayRefusal(2, f"corrupt run record {path}: {e}; repair or delete this file") from None
         if not isinstance(data, dict) or not isinstance(data.get("run_id"), str):
             raise BelayRefusal(2, f"corrupt run record {path}: not a run object; repair or delete this file")
@@ -294,7 +310,10 @@ def claim(store: RunStore, cfg: Config, issue: str, now: datetime,
     marked `failed` with history note `stale`, then a new run is created.
     """
     check_stop(store.root, cfg, labels)
+    now = _parse_iso(_iso(now))  # normalise: naive -> UTC, aware -> converted to UTC
+    issue = str(issue)
     with store.lock():
+        stale: list[dict] = []
         for run in store.list_runs():
             if run.get("state") != "working":
                 continue
@@ -306,9 +325,13 @@ def claim(store: RunStore, cfg: Config, issue: str, now: datetime,
             if age <= timedelta(minutes=cfg.idle_minutes):
                 raise BelayRefusal(
                     5, f"run {run['run_id']} (issue {run.get('issue')}) is already working")
-            if run.get("issue") == str(issue):
-                return run
+            stale.append(run)
+        resumed = None
+        for run in stale:
+            if resumed is None and run.get("issue") == issue:
+                resumed = run
+                continue
             run["state"] = "failed"
             run.setdefault("history", []).append("stale")
             store.save(run)
-        return store.create(issue, cfg.tracker, now)
+        return resumed if resumed is not None else store.create(issue, cfg.tracker, now)
