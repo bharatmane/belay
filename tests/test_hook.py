@@ -213,6 +213,95 @@ class TestHumanOnly(HookBase):
                 self.assertAllow(self.bash(cmd))
 
 
+COMMIT_MERGE = "git commit -m \"$(cat <<'EOF'\nfeat: deny gh pr merge\nEOF\n)\""
+COMMIT_FORCE = ("git commit -m \"$(cat <<'EOF'\nfix: block git push -f and gh pr review "
+                "--approve\n\nCo-Authored-By: x <x@y>\nEOF\n)\"")
+PR_BODY = ("gh pr create --title t --body \"$(cat <<'EOF'\n## Summary\nA human runs "
+           "gh pr merge 5; we never git push --force.\nEOF\n)\"")
+
+
+class TestHeredocs(HookBase):
+    def setUp(self):
+        super().setUp()
+        self.footprint()  # healthy: no STOP, no runs
+
+    def test_message_text_in_quoted_heredocs_allowed(self):
+        for cmd in (COMMIT_MERGE, COMMIT_FORCE, PR_BODY,
+                    "git commit -F - <<'EOF'\nnever git push --force\nEOF",
+                    "git commit -F - <<\"EOF\"\ngh pr merge 1\nEOF",
+                    "git commit -F - <<\\EOF\ngh pr merge 1\nEOF",
+                    "git commit -F - <<-EOF\n\tgh pr merge 1\n\tEOF",
+                    "git commit -m \"$(cat <<'EOF'\nIt's \"gh pr merge\" time\nEOF\n)\"",
+                    "cat <<EOF > notes.txt\ngh pr merge 1\nEOF\ngit status"):
+            with self.subTest(cmd=cmd):
+                self.assertAllow(self.bash(cmd))
+
+    def test_real_commands_still_denied(self):
+        for cmd in ("git commit -m \"$(gh pr merge 1)\"", "echo $(gh pr merge 1)",
+                    "bash -c \"git push -f\"", "cat <<EOF\nx\nEOF\ngh pr merge 1",
+                    "cat <<EOF\n$(gh pr merge 1)\nEOF", "cat <<EOF\n`gh pr merge 1`\nEOF",
+                    "x=$(cat <<EOF\nx\nEOF)\ngh pr merge 1",
+                    "echo \"<<EOF\"\ngh pr merge 1\nEOF", "echo '<<EOF'\ngh pr merge 1\nEOF",
+                    "cat <<<EOF\ngh pr merge 1", "echo $((1<<2))\ngh pr merge 1",
+                    "(( x = 1<<2 ))\ngh pr merge 1", "cat <<EOF\nEOFX\nEOF\ngh pr merge 1",
+                    "cat <<EOF; gh pr merge 1\nbody\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertDeny(self.bash(cmd), HUMAN)
+
+    def test_heredoc_commit_denied_under_stop(self):
+        self.stop()
+        self.assertDeny(self.bash(COMMIT_MERGE), "STOP")
+
+
+class TestNestingAndApi(HookBase):
+    def test_too_deep_is_mutating_not_human(self):
+        self.assertEqual(h.classify_command("ls", depth=h._MAX_DEPTH + 1), (False, True))
+        self.footprint()
+        deep = "eval " * 8 + "ls"
+        self.assertAllow(self.bash(deep))
+        self.stop()
+        self.assertDeny(self.bash(deep), "STOP")
+
+    def test_more_human_only_patterns(self):
+        self.footprint()
+        for cmd in ("gh api graphql -f query='mutation { mergePullRequest(input: {}) { x } }'",
+                    "gh api graphql -f query='mutation { enablePullRequestAutoMerge(input: {}) }'",
+                    "gh api repos/o/r/pulls/5/reviews -f event=approve",
+                    "gh api repos/o/r/pulls/5/reviews --input r.json -f e=APPROVE",
+                    "git push --mirror", "git push --mirror origin"):
+            with self.subTest(cmd=cmd):
+                self.assertDeny(self.bash(cmd), HUMAN)
+
+    def test_option_values_are_not_flags(self):
+        self.footprint()
+        for cmd in ("gh pr review 5 --comment -b '-a thing'",
+                    "gh pr review 5 --comment --body '-a'", "git push -o '-f' origin x",
+                    "git push --push-option -f origin x"):
+            with self.subTest(cmd=cmd):
+                self.assertAllow(self.bash(cmd))
+
+
+class TestRunRecords(HookBase):
+    def runs_file(self):
+        return str(self.root / ".belay" / "runs" / "x.json")
+
+    def test_runs_dir_denied_under_stop(self):
+        self.stop()
+        self.assertDeny(self.run_hook("Write", file_path=self.runs_file(), content="{}"),
+                        "scripts/belay.py")
+        self.assertAllow(self.run_hook("Write", file_path=str(self.root / ".belay" / "STOP"),
+                                       content=""))
+
+    def test_runs_dir_denied_when_spent(self):
+        self.make_run(active_seconds=10_000)
+        self.assertDeny(self.run_hook("Edit", file_path=self.runs_file(), old_string="a",
+                                      new_string="b"), "scripts/belay.py")
+
+    def test_runs_dir_allowed_when_healthy(self):
+        self.make_run(active_seconds=60)
+        self.assertAllow(self.run_hook("Write", file_path=self.runs_file(), content="{}"))
+
+
 class TestBudget(HookBase):
     def test_spent_working_run_denies_write(self):
         run = self.make_run(active_seconds=90 * 60)

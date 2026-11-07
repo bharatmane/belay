@@ -148,5 +148,17 @@ clients (hub, curl to the API, MCP tools such as a GitHub MCP server); shell fil
 (`echo > f`, `sed -i`) are not file-tool calls; edits and writes under `.belay/` are always
 allowed (so the owner can clear STOP), which also means run records there are writable; a
 corrupt run record or bad config fails open, disabling the budget check (STOP still works).
-Over-matching is deliberate: `echo git push` or a commit message mentioning `gh pr merge`
-inside `bash -c '...'` is denied.
+Over-matching is deliberate: `echo git push` or text mentioning `gh pr merge` inside
+`bash -c '...'` is denied.
+
+Fix round (review of 6b): heredoc bodies are stripped before matching, so the standard
+`git commit -m "$(cat <<'EOF' ... EOF)"` and `gh pr create --body "$(cat <<'EOF' ...)"`
+flows are not denied for message text that mentions a denied command; an unquoted
+delimiter's body keeps its `$(...)`/backtick substitutions (they execute). `<<` inside
+quotes, `<<<` and arithmetic `((...))` are not heredocs. Limit: the quote/context tracking
+is approximate, so an exotic mis-detected `<<` could hide the lines after it. Over-deep
+nesting counts as mutating, not human-only. `.belay/runs/` edits are denied under STOP or
+spent budget (run records change only through `scripts/belay.py`); other `.belay/` files
+stay editable. Human-only also covers `gh api` `mergePullRequest`,
+`enablePullRequestAutoMerge`, `APPROVE` and `event=approve`, and `git push --mirror`;
+force/approve flags are read from option tokens only (an option's value is skipped).

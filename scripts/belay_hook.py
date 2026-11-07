@@ -12,7 +12,8 @@ Rules, only when a Belay footprint (`<root>/.belay/` directory) exists:
   * Budget: while any `working` run has spent its budget, mutating calls are denied.
 Mutating = Edit/Write/MultiEdit/NotebookEdit outside `<root>/.belay/`, or a shell command that
 matches the git/gh patterns below. Read-only tools and commands are never denied, and files
-under `.belay/` are always editable, so the owner can never be trapped.
+under `.belay/` (STOP included) stay editable, so the owner can never be trapped. Exception:
+`.belay/runs/` is guarded like any other path (run records change only through belay.py).
 
 FAIL OPEN: any internal error allows the call and prints one stderr line
 `belay hook: ignored internal error: <msg>`. A broken hook must never block the user.
@@ -20,14 +21,17 @@ FAIL OPEN: any internal error allows the call and prints one stderr line
 Command matching (a guardrail, not a sandbox) -- the command is tokenised with shlex (quotes
 removed, so g"it" p'u'sh is git push) and split into segments on ; & | ( ) < > newline and
 backtick. In each segment EVERY token whose basename is git/gh is examined, not just the first
-word, so wrappers (sudo, env, timeout, xargs, VAR=x) are covered. Git global options (-C, -c,
+word, so wrappers (sudo, env, timeout, xargs, VAR=x) are covered. Heredoc bodies are removed
+first (they are data, e.g. a commit message in `$(cat <<'EOF' ... EOF)`); an unquoted-delimiter
+body keeps its $(...)/backtick substitutions, which do execute. Git global options (-C, -c,
 --git-dir ...) are skipped to find the subcommand. Quoted text is re-examined when it holds a
 command substitution ($( or backtick) or the segment calls a shell (bash -c, sh -c, eval, cmd,
 pwsh, Invoke-Expression ...). It over-matches on purpose (`echo git push` is denied under STOP).
 Known limits (not detected): git/gh aliases, commands built from variables ($G push), scripts or
 Makefiles that run git, other binaries (hub, curl to the GitHub API, MCP tools), file writes by
 shell (echo > f, sed -i), and paths outside the root via `cd` in the same command. Unterminated
-quotes fall back to a cruder split that also over-matches.
+quotes fall back to a cruder split that also over-matches. Heredoc detection tracks quotes,
+$(...) and ((...)) approximately; a mis-detected `<<` could hide the lines after it.
 """
 from __future__ import annotations
 
@@ -60,6 +64,123 @@ _MAX_DEPTH = 4
 # ---------------------------------------------------------------------------
 # Shell command classification
 # ---------------------------------------------------------------------------
+
+
+_SUBST_RE = re.compile(r"\$\([^)]*\)?|`[^`]*`?")
+
+
+def _read_delim(s: str, i: int) -> tuple[str, bool, bool, int]:
+    """Parse a heredoc word at s[i:] (after `<<`). Returns (delimiter, quoted, dash, end)."""
+    n = len(s)
+    dash = i < n and s[i] == "-"
+    if dash:
+        i += 1
+    while i < n and s[i] in " \t":
+        i += 1
+    word, quoted = [], False
+    while i < n and s[i] not in " \t\n;&|()<>":
+        c = s[i]
+        if c in "'\"":
+            quoted = True
+            j = s.find(c, i + 1)
+            j = n if j < 0 else j
+            word.append(s[i + 1:j])
+            i = j + 1
+        elif c == "\\":
+            quoted = True
+            word.append(s[i + 1:i + 2])
+            i += 2
+        else:
+            word.append(c)
+            i += 1
+    return "".join(word), quoted, dash, i
+
+
+def strip_heredocs(s: str) -> str:
+    """Remove heredoc bodies: they are data fed to stdin, not commands. A body whose delimiter
+    is unquoted still expands $(...) and `...`, so those substitutions are kept. The operator
+    is only recognised outside quotes (inside "$(...)" too); `<<<` is a here-string. A body
+    ends at a line equal to the delimiter (surrounding whitespace ignored, `)` allowed after
+    it); an unterminated body runs to the end, as in bash. Quote tracking is approximate."""
+    out: list[str] = []
+    # contexts: top, dq (double quotes), sub ($( ... ) inside double quotes), arith ((( ... )))
+    stack = ["top"]
+    pending: list[tuple[str, bool]] = []
+    i, n = 0, len(s)
+    while i < n:
+        c, ctx = s[i], stack[-1]
+        if c == "\n" and ctx != "dq" and pending:
+            out.append("\n")
+            i += 1
+            for delim, quoted in pending:
+                body = []
+                while i < n:
+                    j = s.find("\n", i)
+                    line = s[i:] if j < 0 else s[i:j]
+                    nxt = n if j < 0 else j + 1
+                    stripped = line.strip()
+                    if stripped == delim or (stripped.startswith(delim)
+                                             and stripped[len(delim):].lstrip().startswith(")")):
+                        i = i + line.find(delim) + len(delim)  # keep anything after it
+                        break
+                    body.append(line)
+                    i = nxt
+                if not quoted:
+                    kept = _SUBST_RE.findall("\n".join(body))
+                    if kept:
+                        out.append(" ; ".join(kept) + "\n")
+            pending = []
+            continue
+        if c == "\\" and i + 1 < n:
+            out.append(s[i:i + 2])
+            i += 2
+            continue
+        if ctx == "dq":
+            if c == '"':
+                stack.pop()
+            elif s.startswith("$(", i):
+                stack.append("sub")
+                out.append("$(")
+                i += 2
+                continue
+            out.append(c)
+            i += 1
+            continue
+        # unquoted context (top level, or a command substitution inside double quotes)
+        if c == "'":
+            j = s.find("'", i + 1)
+            j = n - 1 if j < 0 else j
+            out.append(s[i:j + 1])
+            i = j + 1
+            continue
+        if s.startswith("((", i):  # arithmetic: << is a shift there, not a heredoc
+            stack.append("arith")
+            out.append("((")
+            i += 2
+            continue
+        if ctx == "arith":
+            if s.startswith("))", i):
+                stack.pop()
+                out.append("))")
+                i += 2
+                continue
+            out.append(c)
+            i += 1
+            continue
+        if c == '"':
+            stack.append("dq")
+        elif c == ")" and ctx == "sub":
+            stack.pop()
+        elif s.startswith("<<", i) and not s.startswith("<<<", i) and (i == 0 or s[i - 1] != "<"):
+            delim, quoted, _, end = _read_delim(s, i + 2)
+            out.append(s[i:end])
+            i = end
+            if delim:
+                pending.append((delim, quoted))
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def _token_lists(cmd: str) -> list[list[str]]:
@@ -118,16 +239,36 @@ def _short_has(a: str, letter: str) -> bool:
     return len(a) > 1 and a[0] == "-" and a[1] != "-" and letter in a[1:]
 
 
+def _flags(args: list[str], opts_with_arg: set[str]) -> list[str]:
+    """Option tokens only: the value after an option that takes one is skipped, and a token
+    holding whitespace is a quoted value, never a flag."""
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif a.startswith("-") and not re.search(r"\s", a):
+            out.append(a)
+            skip = a in opts_with_arg
+    return out
+
+
+GIT_PUSH_OPTS_WITH_ARG = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
+GH_REVIEW_OPTS_WITH_ARG = {"-b", "--body", "-F", "--body-file", "-R", "--repo"}
+_API_HUMAN_RE = re.compile(r"/merges?(?:$|[/?#])|mergePullRequest|enablePullRequestAutoMerge"
+                           r"|event\s*[=:]\s*[\"']?approve\b", re.I)
+
+
 def _classify_git(args: list[str]) -> tuple[bool, bool]:
     pos = _positionals(args, GIT_OPTS_WITH_ARG)
     if not pos:
         return False, False
     sub = args[pos[0]].lower()
     rest = args[pos[0] + 1:]
-    human = sub == "push" and any(
-        a in ("--force", "--force-if-includes") or a.startswith(("--force-with-lease", "--force="))
-        or _short_has(a, "f") or a.startswith("+")  # +refspec is a force push
-        for a in rest)
+    human = sub == "push" and (
+        any(a in ("--force", "--force-if-includes", "--mirror")
+            or a.startswith(("--force-with-lease", "--force=")) or _short_has(a, "f")
+            for a in _flags(rest, GIT_PUSH_OPTS_WITH_ARG))
+        or any(a.startswith("+") for a in rest))  # +refspec is a force push
     return human, sub in GIT_MUTATING
 
 
@@ -139,14 +280,14 @@ def _classify_gh(args: list[str]) -> tuple[bool, bool]:
     action = pos[1] if len(pos) > 1 else ""
     if group == "pr":
         approve = action == "review" and any(
-            a.startswith("--approve") or _short_has(a, "a") for a in args)
+            a.startswith("--approve") or _short_has(a, "a")
+            for a in _flags(args, GH_REVIEW_OPTS_WITH_ARG))
         human = action == "merge" or approve
         return human, action in GH_PR_MUTATING
     if group == "issue":
         return False, action in GH_ISSUE_MUTATING
     if group == "api":
-        human = any(re.search(r"/merges?(?:$|[/?#])", a) or re.search(r"event=approve", a, re.I)
-                    for a in args)
+        human = any(_API_HUMAN_RE.search(a) or re.search(r"\bAPPROVE\b", a) for a in args)
         method = "GET"
         for j, a in enumerate(args):
             if a in ("-X", "--method") and j + 1 < len(args):
@@ -165,7 +306,8 @@ def classify_command(cmd: str, depth: int = 0) -> tuple[bool, bool]:
     """(human_only, mutating) for a Bash/PowerShell command line."""
     human = mutating = False
     if depth > _MAX_DEPTH:
-        return True, True  # absurd nesting: treat as dangerous
+        return False, True  # absurd nesting: mutating (denied under STOP/budget), not human-only
+    cmd = strip_heredocs(cmd)
     segs = [seg for toks in _token_lists(cmd) for seg in _segments(toks)]
     # A shell anywhere in the line (bash -c '...', echo '...' | sh) makes quoted text suspect.
     shell_call = any(_prog(t) in SHELL_INVOKERS for seg in segs for t in seg)
@@ -210,8 +352,8 @@ def _canon(p: str) -> str:
     return os.path.normcase(os.path.realpath(p))
 
 
-def _under_belay(path: str, root: str) -> bool:
-    base = _canon(os.path.join(root, ".belay"))
+def _under_belay(path: str, root: str, sub: str = "") -> bool:
+    base = _canon(os.path.join(root, ".belay", sub) if sub else os.path.join(root, ".belay"))
     target = _canon(path)
     try:
         return os.path.commonpath([base, target]) == base
@@ -307,10 +449,19 @@ def decide(data: dict, now) -> str | None:
     if human:
         return HUMAN_REASON
 
-    mutating_roots = [rt for rt in roots if target is None or not _under_belay(target, rt)]
+    # Files under .belay/ stay editable so the owner can clear STOP, except run records, which
+    # change only through scripts/belay.py (guarded like any other edit).
+    def exempt(rt: str) -> bool:
+        return (target is not None and _under_belay(target, rt)
+                and not _under_belay(target, rt, "runs"))
+
+    runs_note = ""
+    if target is not None and any(_under_belay(target, rt, "runs") for rt in roots):
+        runs_note = " Run records under .belay/runs/ change only through scripts/belay.py."
+    mutating_roots = [rt for rt in roots if not exempt(rt)]
     for rt in mutating_roots:
         if os.path.exists(os.path.join(rt, ".belay", "STOP")):
-            return _stop_reason(rt)
+            return _stop_reason(rt) + runs_note
     if not mutating_roots:
         return None
     helper = _load_helper()
@@ -320,7 +471,7 @@ def decide(data: dict, now) -> str | None:
     for rt in mutating_roots:
         reason = _budget_reason(helper, rt, now)
         if reason:
-            return reason
+            return reason + runs_note
     return None
 
 
