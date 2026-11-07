@@ -1,0 +1,4 @@
+.belay/
+__pycache__/
+*.pyc
+.superpowers/
