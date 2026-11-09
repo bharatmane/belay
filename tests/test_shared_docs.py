@@ -1,6 +1,7 @@
 """Checks that the shared documents the skills link to stay complete and consistent."""
 import contextlib
 import io
+import json
 import re
 import sys
 import tomllib
@@ -127,6 +128,21 @@ class LinkTests(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(v.main([str(ROOT)]), 0, out.getvalue())
+
+
+class ReadmeTests(unittest.TestCase):
+    def test_readme_install_command_matches_manifests(self):
+        plugin = json.loads(read(".claude-plugin/plugin.json"))
+        market = json.loads(read(".claude-plugin/marketplace.json"))
+        readme = read("README.md")
+        self.assertIn(f"/plugin install {plugin['name']}@{market['name']}", readme)
+        self.assertIn("/plugin marketplace add bharatmane/belay", readme)
+
+    def test_readme_names_every_skill(self):
+        readme = read("README.md")
+        for skill in sorted(p.name for p in (ROOT / "skills").iterdir() if p.is_dir()):
+            with self.subTest(skill):
+                self.assertIn(f"`belay:{skill}`", readme)
 
 
 if __name__ == "__main__":
