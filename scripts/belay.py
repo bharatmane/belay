@@ -338,7 +338,7 @@ def check_stop(root: Path, cfg: Config, labels: Sequence[str] = ()) -> None:
     The label match ignores case and surrounding whitespace (GitHub label names are
     case-insensitive), so it can only make the stop label stronger."""
     if (Path(root) / ".belay" / "STOP").exists():
-        raise BelayRefusal(3, "stop switch: .belay/STOP exists; delete it to resume")
+        raise BelayRefusal(3, "stop switch: .belay/STOP exists; only the owner clears it")
     if _has_label(labels, cfg.labels["stop"]):
         raise BelayRefusal(3, f"stop switch: issue has label {cfg.labels['stop']!r}")
 

@@ -46,6 +46,9 @@ class StoreTests(unittest.TestCase):
             b.claim(self.store, self.cfg, "1", NOW)
         self.assertEqual(cm.exception.code, 3)
         self.assertEqual(self.store.list_runs(), [])
+        # the reason is shown to the model: it must not coach deleting the stop file
+        self.assertNotIn("delete", cm.exception.reason)
+        self.assertIn("owner", cm.exception.reason)
 
     def test_claim_refused_when_stop_label_present(self):
         with self.assertRaises(b.BelayRefusal) as cm:
