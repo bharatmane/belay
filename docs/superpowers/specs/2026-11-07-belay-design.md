@@ -1,6 +1,7 @@
 # Belay — design
 
-Status: draft for approval. Nothing is built yet.
+Status: approved and implemented as v0.1.0-dev on branch feat/v1 (GitHub only). Goal 2 (Jira
+parity) is deferred by plan decision: the Jira adapter is documented as unsupported.
 Date: 2026-11-07. Owner: Bharat.
 
 Items marked **(my call)** are decisions the design author made without the owner
@@ -37,7 +38,8 @@ differentiator.
 ## 3. Goals
 
 1. Safe default behaviour: an agent run is bounded, interruptible, and auditable.
-2. Works the same on GitHub Issues and Jira from the user's point of view.
+2. Works the same on GitHub Issues and Jira from the user's point of view. (Deferred: v0.1 is
+   GitHub only.)
 3. Each skill is useful on its own; the dispatcher composes them.
 4. Easy to install and read: markdown skills plus one small helper script.
 5. Honest about what is enforced and what is only instructed.

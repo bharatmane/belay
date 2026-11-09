@@ -5,5 +5,5 @@
   "author": { "name": "Bharat Mane" },
   "repository": "https://github.com/bharatmane/belay",
   "license": "MIT",
-  "keywords": ["issues", "pull-requests", "code-review", "safety", "github", "jira", "workflow"]
+  "keywords": ["issues", "pull-requests", "code-review", "safety", "github", "workflow"]
 }
