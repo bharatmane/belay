@@ -76,6 +76,9 @@ class TestCli(CliBase):
         # 8 high-risk path
         self.write_cfg('owner = "alice"\nhigh_risk_paths = ["src/auth/**"]\n')
         self.assertEqual(self.run_cli("check-paths", "--changed", "src/auth/x.py")[0], 8)
+        # a repeated --changed must accumulate, not keep only the last group
+        self.assertEqual(self.run_cli("check-paths", "--changed", "src/auth/x.py",
+                                      "--changed", "README.md")[0], 8)
         # 9 non-owner override
         code, data = self.run_cli("override", rid, "--as", "mallory", "--kind", "extend",
                                   "--reason", "r", "--minutes", "5")

@@ -803,7 +803,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp = cmd("check-stop", run=False)
     sp.add_argument("--label", action="append", default=[])
     sp = cmd("check-paths", run=False)
-    sp.add_argument("--changed", nargs="+", required=True, help="paths, or `-` to read stdin")
+    sp.add_argument("--changed", nargs="+", action="extend", required=True, help="paths, or `-` to read stdin")
     sp.add_argument("--label", action="append", default=[])
     sp = cmd("override")
     sp.add_argument("--as", required=True, dest="who",
