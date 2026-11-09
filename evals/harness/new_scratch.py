@@ -96,7 +96,7 @@ def build_dispatch(scratch, scenario, seeded):
         old = now - timedelta(minutes=61)
         iso = old.strftime("%Y-%m-%dT%H:%M:%SZ")
         run_record(scratch, "12", "working", now, started=now - timedelta(hours=2), stage="tests",
-                   heartbeat=iso, last_tick=iso, active_seconds=90 * 60 - 5)
+                   heartbeat=iso, last_tick=iso, active_seconds=90 * 60)
     elif scenario == "dispatch-override":
         at = (now - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
         run_record(scratch, "12", "failed", now, started=now - timedelta(hours=3), stage="tests",

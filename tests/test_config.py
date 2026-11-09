@@ -100,10 +100,11 @@ attempts_per_stage = 5
 
     def test_negative_budget_raises_refusal_code_2(self):
         for text in ("[budget]\nactive_minutes = -1\n", "[budget]\nattempts_per_stage = 0\n",
-                     "idle_minutes = -5\n"):
+                     "idle_minutes = -5\n", "idle_minutes = 0\n"):
             with self.assertRaises(b.BelayRefusal) as cm:
                 b.load_config(write(text))
             self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(b.load_config(write("idle_minutes = 1\n"))[0].idle_minutes, 1)
 
     def test_tracker_must_be_github_or_jira(self):
         with self.assertRaises(b.BelayRefusal) as cm:

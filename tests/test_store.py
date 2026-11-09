@@ -65,8 +65,22 @@ class StoreTests(unittest.TestCase):
         run = b.claim(self.store, self.cfg, "1", NOW)
         later = NOW + timedelta(minutes=self.cfg.idle_minutes + 1)
         again = b.claim(self.store, self.cfg, "1", later)
-        self.assertEqual(again, run)
+        self.assertEqual(again["run_id"], run["run_id"])
+        self.assertEqual(again["state"], "working")
+        self.assertEqual(again["heartbeat"], b._iso(later))
         self.assertEqual(len(self.store.list_runs()), 1)
+
+    def test_same_second_run_ids_do_not_collide(self):
+        first = self.store.create("1", "github", NOW)
+        first["state"] = "failed"
+        self.store.save(first)
+        second = self.store.create("1", "github", NOW)
+        self.assertNotEqual(first["run_id"], second["run_id"])
+        self.assertEqual(second["run_id"], first["run_id"] + "-2")
+        self.assertEqual(self.store.load(first["run_id"])["state"], "failed")
+        third = self.store.create("1", "github", NOW)
+        self.assertEqual(third["run_id"], first["run_id"] + "-3")
+        self.assertEqual(len(self.store.list_runs()), 3)
 
     def test_stale_run_other_issue_marked_failed(self):
         run = b.claim(self.store, self.cfg, "1", NOW)
@@ -201,7 +215,7 @@ class StoreTests(unittest.TestCase):
         r2 = self.store.create("B", "github", NOW)
         later = NOW + timedelta(minutes=self.cfg.idle_minutes + 1)
         got = b.claim(self.store, self.cfg, "A", later)
-        self.assertEqual(got, r1)
+        self.assertEqual(got["run_id"], r1["run_id"])
         self.assertEqual(self.store.load(r2["run_id"])["state"], "failed")
         self.assertEqual(self.store.load(r1["run_id"])["state"], "working")
 

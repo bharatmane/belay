@@ -132,6 +132,17 @@ class TestCli(CliBase):
         self.assertEqual(code, 8)
         self.assertIn("src/auth/x.py", data["reason"])
 
+    def test_check_paths_absolute_paths(self):
+        self.write_cfg('high_risk_paths = ["migrations/**", "auth/"]\n')
+        root = self.root.resolve()
+        for p in (str(root / "migrations" / "1.sql"), str(root / "auth" / "login.py")):
+            code, data = self.run_cli("check-paths", "--changed", p)
+            self.assertEqual(code, 8, (p, data))
+        code, data = self.run_cli("check-paths", "--changed", str(root / "README.md"))
+        self.assertEqual(code, 0, data)
+        code, data = self.run_cli("check-paths", "--changed", str(root.parent / "x" / "auth" / "a.py"))
+        self.assertEqual(code, 2, data)
+
     def test_lifecycle_commands(self):
         rid = self.claim("3")
         self.assertEqual(self.run_cli("heartbeat", rid)[0], 0)

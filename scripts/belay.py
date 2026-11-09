@@ -106,8 +106,8 @@ def load_config(path: Path | None) -> tuple[Config, list[str]]:
     if tracker not in ("github", "jira"):
         raise _bad('tracker must be "github" or "jira"')
     idle = _typed(data, "idle_minutes", int, 60)
-    if idle < 0:
-        raise _bad("idle_minutes must be >= 0")
+    if idle < 1:
+        raise _bad("idle_minutes must be >= 1 (0 would credit no time and make every run stale)")
     paths = _typed(data, "high_risk_paths", list, [])
     if not all(isinstance(p, str) for p in paths):
         raise _bad("high_risk_paths must be a list of strings")
@@ -222,9 +222,16 @@ class RunStore:
         return self.runs_dir / f"{run_id}.json"
 
     def create(self, issue: str, tracker: str, now: datetime) -> dict:
+        """New `working` run. Never overwrites a record: a second run for the same issue in the
+        same second gets a `-2`, `-3` ... suffix. Call while holding lock() (claim does)."""
         ts = _iso(now)
+        base = run_id = make_run_id(issue, now)
+        n = 1
+        while self._path(run_id).exists():
+            n += 1
+            run_id = f"{base}-{n}"
         run = {
-            "run_id": make_run_id(issue, now), "issue": str(issue), "tracker": tracker,
+            "run_id": run_id, "issue": str(issue), "tracker": tracker,
             "state": "working", "stage": "start", "started_at": ts, "heartbeat": ts,
             "last_tick": ts, "active_seconds": 0, "attempts": {}, "evidence": [],
             "history": [], "overrides": [], "extension_minutes": 0,
@@ -340,8 +347,11 @@ def claim(store: RunStore, cfg: Config, issue: str, now: datetime,
           labels: Sequence[str] = ()) -> dict:
     """Claim `issue` for a run. Only a `working` run blocks (code 5); a stale one is recovered.
 
-    Stale = heartbeat older than cfg.idle_minutes. Same issue: resumed unchanged. Other issue:
-    marked `failed` with history note `stale`, then a new run is created.
+    Stale = heartbeat older than cfg.idle_minutes. Same issue: recovered, with `heartbeat` and
+    `last_tick` moved to `now` (the downtime is not charged to the budget, and the run is fresh
+    again, so another session's claim cannot fail it before its first heartbeat) and a history
+    note `recovered`. Other issue: marked `failed` with history note `stale`, then a new run is
+    created.
     """
     check_stop(store.root, cfg, labels)
     now = _parse_iso(_iso(now))  # normalise: naive -> UTC, aware -> converted to UTC
@@ -367,7 +377,12 @@ def claim(store: RunStore, cfg: Config, issue: str, now: datetime,
                 continue
             _transition(run, "failed", now, "stale")
             store.save(run)
-        return resumed if resumed is not None else store.create(issue, cfg.tracker, now)
+        if resumed is None:
+            return store.create(issue, cfg.tracker, now)
+        resumed["heartbeat"] = resumed["last_tick"] = _iso(now)
+        _transition(resumed, "working", now, "recovered")
+        store.save(resumed)
+        return resumed
 
 
 # ---------------------------------------------------------------------------
@@ -416,9 +431,13 @@ def budget(cfg: Config, run: dict, now: datetime) -> dict:
 
 
 def heartbeat(store: RunStore, cfg: Config, run_id: str, now: datetime) -> dict:
+    """Credit working time and refresh the heartbeat. Only a `working` run beats: any other
+    state (failed by another session's stale recovery, waiting, review) is code 6."""
     now = _parse_iso(_iso(now))
     with store.lock():
         run = _load_for_update(store, run_id)
+        if run.get("state") != "working":
+            raise BelayRefusal(6, f"cannot heartbeat: run {run_id} is {run.get('state')}, not working")
         _credit(cfg, run, now)
         store.save(run)
     bd = budget(cfg, run, now)
@@ -569,8 +588,8 @@ def hand_off(store: RunStore, cfg: Config, run_id: str, head: str, now: datetime
 
 def _norm_path(p: str) -> str:
     """Canonical repo-relative spelling: `/` separators, no drive letter, `//` and `/./` collapsed,
-    `..` resolved, no leading `/` or `./`. Limitation: an absolute path (drive-letter form such as C:/repo/src/x.py) only
-    loses its drive and leading slash; without the repo root its prefix cannot be resolved.
+    `..` resolved, no leading `/` or `./`. Used for patterns and for paths already made
+    repo-relative: check_paths turns absolute paths into repo-relative ones first (_relative_to).
     A path that climbs above the root keeps a leading `..`.
     """
     p = str(p).replace("\\", "/").strip()
@@ -622,22 +641,52 @@ def matches_glob(path: str, pattern: str) -> bool:
     a trailing `/` means the whole directory. Own implementation, not fnmatch (its `*` crosses
     `/`). Matching is case-INSENSITIVE on every platform: this guards a refusal gate, so it must
     over-match (e.g. `SRC/Auth/x.py` on a case-insensitive filesystem) rather than under-match.
-    Paths and patterns are normalised by _norm_path (see its limitation for absolute paths).
+    Paths and patterns are normalised by _norm_path; check_paths makes absolute paths relative first.
     """
     if not pattern:
         return False
     return _glob_regex(pattern).fullmatch(_norm_path(path)) is not None
 
 
-def check_paths(cfg: Config, changed: Sequence[str], labels: Sequence[str]) -> None:
+def _is_abs(p: str) -> bool:
+    """Absolute on any platform: `/x`, `\\x`, `C:...` (a drive-relative `C:x` counts too)."""
+    p = p.strip()
+    return p.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:", p) is not None
+
+
+def _relative_to(p: str, roots: Sequence[Path]) -> str:
+    """Repo-relative spelling of an absolute path: relative to the first root (main checkout or
+    one of its worktrees, which map to the same repo-relative paths) that contains it. Matching
+    follows the platform (case-insensitive on Windows). Outside every root: code 2, because a
+    refusal gate must never pass a path it cannot place."""
+    target = os.path.realpath(os.path.abspath(p.strip()))
+    for root in roots:
+        base = os.path.realpath(os.path.abspath(str(root)))
+        try:
+            rel = os.path.relpath(target, base)
+        except ValueError:  # another drive
+            continue
+        rel = rel.replace("\\", "/")
+        if rel != ".." and not rel.startswith("../"):
+            return rel
+    where = ", ".join(str(r) for r in roots) or "no root given"
+    raise BelayRefusal(2, f"changed path {p.strip()} is outside the repository ({where}); pass "
+                          "repo-relative paths")
+
+
+def check_paths(cfg: Config, changed: Sequence[str], labels: Sequence[str],
+                roots: Sequence[Path] = ()) -> None:
     """Refuse (code 8) when a changed path matches cfg.high_risk_paths and the issue lacks the approved label.
 
-    The approved label matches ignoring case and surrounding whitespace, because GitHub treats
-    `Belay:Approved` and `belay:approved` as the same label."""
+    Absolute paths (either separator) are made relative to `roots` (the repo root and its
+    worktrees) before matching; one outside every root, or any absolute path when no root is
+    given, is code 2. The approved label matches ignoring case and surrounding whitespace,
+    because GitHub treats `Belay:Approved` and `belay:approved` as the same label."""
     for name, seq in (("changed", changed), ("labels", labels)):
-        if isinstance(seq, (str, bytes)) or not isinstance(seq, (list, tuple, set, frozenset))                 or not all(isinstance(x, str) for x in seq):
+        if isinstance(seq, (str, bytes)) or not isinstance(seq, (list, tuple, set, frozenset)) \
+                or not all(isinstance(x, str) for x in seq):
             raise BelayRefusal(2, f"{name} must be a list of strings, not a bare string")
-    norm = [_norm_path(p) for p in changed]
+    norm = [_norm_path(_relative_to(p, roots) if _is_abs(p) else p) for p in changed]
     for p in norm:
         if p == ".." or p.startswith("../"):
             raise BelayRefusal(2, f"changed path escapes the repo: {p}")
@@ -791,6 +840,16 @@ def _default_root() -> Path:
     return Path(top) if top else Path.cwd()
 
 
+def _repo_roots(root: Path) -> list[Path]:
+    """The root and every worktree of its repository (`git worktree list --porcelain`)."""
+    roots = [Path(root)]
+    out = _git_out("-C", str(root), "worktree", "list", "--porcelain")
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            roots.append(Path(line[len("worktree "):].strip()))
+    return roots
+
+
 def _emit(obj: dict) -> None:
     """Print one JSON line. A dead stdout never raises: the exit code still carries the result."""
     try:
@@ -851,7 +910,7 @@ def _dispatch(args, root: Path, cfg: Config, store: RunStore, now: datetime) -> 
                 changed.extend(_read_paths(sys.stdin.read()))
             else:
                 changed.append(v)
-        check_paths(cfg, changed, args.label)
+        check_paths(cfg, changed, args.label, _repo_roots(root))
         res: dict = {"checked": len(changed)}
         if not changed:
             res["_warnings"] = ["no changed paths were supplied; the high-risk gate checked nothing"]

@@ -1,3 +1,4 @@
+import os
 import sys
 import tempfile
 import unittest
@@ -116,12 +117,48 @@ class GlobTests(unittest.TestCase):
 
 class NormaliseTests(Base):
     def test_path_spellings_all_match(self):
-        for p in ("src/../src/auth/x.py", "src/./auth/x.py", "src//auth/x.py", "/src/auth/x.py",
-                  "C:\\src\\auth\\x.py", "c:/src/auth/x.py", ".\\src\\auth\\x.py"):
+        for p in ("src/../src/auth/x.py", "src/./auth/x.py", "src//auth/x.py",
+                  ".\\src\\auth\\x.py", "src\\auth\\x.py"):
             self.assertTrue(b.matches_glob(p, "src/auth/**"), p)
             with self.assertRaises(b.BelayRefusal) as cm:
                 b.check_paths(self.cfg, [p], [])
             self.assertEqual(cm.exception.code, 8, p)
+
+    def test_absolute_paths_are_made_relative_to_the_root(self):
+        root = Path(self._tmp.name).resolve()
+        for p in (str(root / "src" / "auth" / "x.py"),
+                  str(root / "src" / "auth" / "x.py").replace("\\", "/"),
+                  str(root) + "/src/../src/auth/x.py", str(root / "db" / "migrations" / "1.sql")):
+            with self.assertRaises(b.BelayRefusal) as cm:
+                b.check_paths(self.cfg, [p], [], roots=[root])
+            self.assertEqual(cm.exception.code, 8, p)
+        if os.name == "nt":
+            with self.assertRaises(b.BelayRefusal) as cm:
+                b.check_paths(self.cfg, [str(root / "src" / "auth" / "x.py").upper()], [],
+                              roots=[root])
+            self.assertEqual(cm.exception.code, 8)
+        b.check_paths(self.cfg, [str(root / "README.md")], [], roots=[root])
+        b.check_paths(self.cfg, [str(root / "src" / "auth" / "x.py")], ["belay:approved"],
+                      roots=[root])
+
+    def test_absolute_path_in_a_second_root_maps_to_the_same_relative_path(self):
+        root = Path(self._tmp.name).resolve()
+        wt = root.parent / (root.name + "-belay-x")
+        with self.assertRaises(b.BelayRefusal) as cm:
+            b.check_paths(self.cfg, [str(wt / "src" / "auth" / "x.py")], [], roots=[root, wt])
+        self.assertEqual(cm.exception.code, 8)
+
+    def test_absolute_path_outside_every_root_refused_code_2(self):
+        root = Path(self._tmp.name).resolve()
+        for p in (str(root.parent / "elsewhere" / "src" / "auth" / "x.py"), "/src/auth/x.py",
+                  "C:\\src\\auth\\x.py", "c:/src/auth/x.py"):
+            with self.assertRaises(b.BelayRefusal) as cm:
+                b.check_paths(self.cfg, [p], ["belay:approved"], roots=[root])
+            self.assertEqual(cm.exception.code, 2, p)
+            self.assertIn("outside", cm.exception.reason)
+        # without any root an absolute path cannot be placed: refused, never passed
+        self.assertEqual(self.code(b.check_paths, self.cfg,
+                                   [str(root / "src" / "auth" / "x.py")], []), 2)
 
     def test_pattern_spellings_normalised(self):
         for pat in ("./src//auth/**", "src/./auth/**", "C:/src/auth/**", "/src/auth/**"):

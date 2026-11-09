@@ -101,12 +101,40 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(self.code(b.resume, self.store, self.cfg, "nope", mins(2)), 6)
         self.assertEqual(self.code(b.heartbeat, self.store, self.cfg, "nope", mins(2)), 6)
 
-    def test_heartbeat_on_non_working_run_credits_nothing(self):
+    def test_heartbeat_on_non_working_run_refused_code_6(self):
         b.wait(self.store, self.cfg, self.rid, "x", mins(1))
-        r = b.heartbeat(self.store, self.cfg, self.rid, mins(30))
-        self.assertEqual(r["active_seconds"], 60)
-        self.assertEqual(r["state"], "waiting")
-        self.assertEqual(r["heartbeat"], "2026-01-02T03:30:00Z")
+        self.assertEqual(self.code(b.heartbeat, self.store, self.cfg, self.rid, mins(30)), 6)
+        r = self.store.load(self.rid)
+        self.assertEqual((r["active_seconds"], r["state"]), (60, "waiting"))
+        self.assertEqual(r["heartbeat"], "2026-01-02T03:01:00Z")  # unchanged
+        b.resume(self.store, self.cfg, self.rid, mins(31))
+        b.fail(self.store, self.cfg, self.rid, "gave up", mins(32))
+        self.assertEqual(self.code(b.heartbeat, self.store, self.cfg, self.rid, mins(33)), 6)
+
+    def test_heartbeat_on_review_run_refused_code_6(self):
+        b.record_evidence(self.store, self.rid, command="t", exit_code=0, head="abc", stage="test",
+                          now=mins(1))
+        b.hand_off(self.store, self.cfg, self.rid, "abc", mins(2))
+        self.assertEqual(self.code(b.heartbeat, self.store, self.cfg, self.rid, mins(3)), 6)
+
+    def test_recovered_run_is_not_charged_for_downtime(self):
+        b.heartbeat(self.store, self.cfg, self.rid, mins(40))  # 40 active minutes
+        later = T0 + timedelta(hours=8)
+        run = b.claim(self.store, self.cfg, "7", later)
+        self.assertEqual(run["run_id"], self.rid)
+        self.assertEqual(run["heartbeat"], "2026-01-02T11:00:00Z")
+        self.assertEqual(run["last_tick"], "2026-01-02T11:00:00Z")
+        self.assertEqual(run["active_seconds"], 40 * 60)
+        self.assertEqual(run["history"][-1]["note"], "recovered")
+        self.assertEqual(self.store.load(self.rid), run)  # saved under the lock
+        r = b.heartbeat(self.store, self.cfg, self.rid, later + timedelta(minutes=5))
+        self.assertEqual(r["active_seconds"], 45 * 60)
+
+    def test_recovered_run_cannot_be_failed_by_another_claim(self):
+        later = T0 + timedelta(hours=8)
+        b.claim(self.store, self.cfg, "7", later)
+        self.assertEqual(self.code(b.claim, self.store, self.cfg, "8", later + timedelta(minutes=1)), 5)
+        self.assertEqual(self.store.load(self.rid)["state"], "working")
 
     def test_resume_blocked_by_other_fresh_working_run(self):
         b.wait(self.store, self.cfg, self.rid, "x", mins(1))

@@ -157,7 +157,7 @@ class DispatchScratch(unittest.TestCase):
         scratch, _ = self.make("dispatch-budget-spent")
         code, out = self.helper(scratch, "claim", "12")
         self.assertEqual(code, 0, out)
-        self.assertEqual(out["run"]["active_seconds"], 90 * 60 - 5)
+        self.assertEqual(out["run"]["active_seconds"], 90 * 60)
         code, out = self.helper(scratch, "heartbeat", out["run_id"])
         self.assertEqual((code, out["code"]), (4, 4))
 
