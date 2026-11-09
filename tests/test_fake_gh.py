@@ -231,6 +231,32 @@ class PrCommands(FakeGhCase):
         self.assertEqual(st.get("prs", [{}])[0].get("state", "OPEN"), "OPEN")
 
 
+    def test_api_writes_are_logged_and_blocked(self):
+        writes = [
+            ("api", "-X", "POST", "repos/o/r/pulls/7/comments", "-f", "body=x"),
+            ("api", "--method", "PATCH", "repos/o/r/pulls/7"),
+            ("api", "--method=DELETE", "repos/o/r/issues/comments/1"),
+            ("api", "-XPUT", "repos/o/r/pulls/7/merge"),
+            ("api", "repos/o/r/pulls/7/comments", "-f", "body=x"),
+            ("api", "repos/o/r/pulls/7/reviews", "-F", "event=APPROVE"),
+            ("api", "repos/o/r/pulls/7/reviews", "--input", "r.json"),
+            ("api", "repos/o/r/issues/7/comments", "--raw-field=body=x"),
+            ("api", "graphql", "-f", "query=mutation { addComment(input: {}) { clientMutationId } }"),
+            ("api", "graphql", "-X", "PUT", "-f", "query=query{x}"),
+        ]
+        for argv in writes:
+            with self.subTest(argv):
+                self.assertIn("fake gh: write blocked", self.gh(*argv, expect=1).stderr)
+        logged = (self.state.parent / "calls.log").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(logged), len(writes))
+
+    def test_api_reads_still_work(self):
+        self.assertEqual(self.gh("api", "user", "--jq", ".login").stdout.strip(), "octocat")
+        out = self.js("api", "graphql", "-f", "query=query($owner:String!){repository{mutationCount}}",
+                      "-f", "owner=o", "-f", "name=r", "-F", "number=7")
+        self.assertIn("reviewThreads", out["data"]["repository"]["pullRequest"])
+
+
 class PrScenarios(FakeGhCase):
     def prs(self, name):
         self.env["BELAY_FAKE_GH_SCENARIO"] = name
@@ -256,12 +282,22 @@ class PrScenarios(FakeGhCase):
         self.assertIn("AI reviewers", self.gh("pr", "diff", "7").stdout)
 
 
+    def test_foreign_marker_is_by_another_author(self):
+        self.prs("pr-foreign-marker")
+        v = self.js("pr", "view", "7", "--json", "headRefOid,comments,reviews")
+        self.assertEqual(v["reviews"], [])
+        c = v["comments"][0]
+        self.assertIn(f"<!-- belay:review=7@{v['headRefOid']} -->", c["body"])
+        self.assertNotEqual(c["author"]["login"], self.gh("api", "user", "--jq", ".login").stdout.strip())
+
+
 class PrScratchRepo(unittest.TestCase):
     def test_head_sha_is_checkoutable_for_each_scenario(self):
         import shutil
         if shutil.which("git") is None:
             self.skipTest("git not installed")
-        for name in ("pr-bug-nit-preexisting", "pr-draft-trivial", "pr-already-reviewed", "pr-injection"):
+        for name in ("pr-bug-nit-preexisting", "pr-draft-trivial", "pr-already-reviewed", "pr-injection",
+                     "pr-foreign-marker"):
             with self.subTest(name):
                 p = subprocess.run([sys.executable, str(HARNESS / "new_scratch.py"), name], capture_output=True, text=True)
                 self.assertEqual(p.returncode, 0, p.stderr)

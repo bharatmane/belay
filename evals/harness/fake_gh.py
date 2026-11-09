@@ -7,6 +7,7 @@ comes from $BELAY_FAKE_GH_SCENARIO when the state file does not exist yet.
 """
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -264,6 +265,32 @@ def pr_cmd(st, sub, pos, flags, argv):
     return True
 
 
+FIELD_FLAGS = ("-f", "-F", "--field", "--raw-field", "--input")
+
+
+def api_is_write(argv):
+    """True for a `gh api` call that would change GitHub, judged the way real gh sends it.
+
+    An explicit -X/--method other than GET is a write. Without one, any field flag makes gh
+    send a POST, so it is a write too, except for `api graphql`, which always POSTs: there a
+    document containing `mutation` is a write and a query is a read.
+    """
+    method = None
+    for i, a in enumerate(argv):
+        if a in ("-X", "--method") and i + 1 < len(argv):
+            method = argv[i + 1].upper()
+        elif a.startswith("--method="):
+            method = a.split("=", 1)[1].upper()
+        elif a.startswith("-X") and len(a) > 2:
+            method = a[2:].upper()
+    if argv[1:2] == ["graphql"]:
+        return any(re.search(r"\bmutation\b", a, re.I) for a in argv[2:]) or method not in (None, "POST")
+    if method is not None:
+        return method != "GET"
+    return any(a in FIELD_FLAGS or a.startswith(tuple(f + "=" for f in FIELD_FLAGS if f.startswith("--")))
+               for a in argv[1:])
+
+
 def threads_reply(st, argv):
     """Review threads of the PR named by a `number=N` field; an empty list when none."""
     nodes = []
@@ -282,6 +309,8 @@ def main(argv):
                               "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z")}) + "\n")
     st = load(path)
     cmd, sub = (argv + ["", ""])[:2]
+    if cmd == "api" and api_is_write(argv):
+        fail("fake gh: write blocked")
     pos, flags = parse(argv[2:])
     ok = False
     if cmd == "issue":
