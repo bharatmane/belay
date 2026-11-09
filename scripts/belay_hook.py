@@ -7,13 +7,22 @@ opinion: the normal permission flow applies) or prints a PreToolUse `permissionD
 object. It ALWAYS exits 0, so a deny is carried by JSON, never by exit code 2.
 
 Rules, only when a Belay footprint (`<root>/.belay/` directory) exists:
-  * Human-only: `gh pr merge`, approving reviews and force pushes are always denied.
+  * Owner's controls: file-tool edits of `.belay.toml` and `.belay/runs/`, and shell commands
+    that look like they change `.belay/STOP`, `.belay/runs/` or `.belay.toml` (rm, mv, del,
+    Remove-Item, redirects, sed -i, truncate, interpreters ...: see touches_controls, a
+    best-effort pattern match) are always denied. The owner changes them outside the session.
+  * Human-only, always denied: `gh pr merge`, approving reviews, force/mirror/all/prune pushes,
+    pushes whose destination is the base branch (configured `base_branch`, plus main and
+    master), remote branch deletions, adding the ready/approved/stop labels or removing the
+    approved/stop labels (gh issue/pr edit, gh issue create, gh label edit/delete, gh api), and
+    `gh api` merge/approve/ref/contents writes, including graphql or review/merge calls whose
+    body comes from a file or stdin (`--input`, `key=@file`) and so cannot be inspected.
   * Stop switch: while `<root>/.belay/STOP` exists, mutating calls are denied.
   * Budget: while any `working` run has spent its budget, mutating calls are denied.
 Mutating = Edit/Write/MultiEdit/NotebookEdit outside `<root>/.belay/`, or a shell command that
-matches the git/gh patterns below. Read-only tools and commands are never denied, and files
-under `.belay/` (STOP included) stay editable, so the owner can never be trapped. Exception:
-`.belay/runs/` is guarded like any other path (run records change only through belay.py).
+matches the git/gh patterns below. Read-only tools and commands are never denied. Other files
+under `.belay/` (STOP itself, tmp/) stay editable by file tools, and the owner clears STOP
+from their own terminal, which the hook never sees, so nobody is trapped.
 
 FAIL OPEN: any internal error allows the call and prints one stderr line
 `belay hook: ignored internal error: <msg>`. A broken hook must never block the user.
@@ -34,23 +43,34 @@ command substitution ($( or backtick) or the segment calls a shell (bash -c, sh 
 pwsh, Invoke-Expression ...). It over-matches on purpose (`echo git push` is denied under STOP).
 Known limits (not detected): git/gh aliases, commands built from variables ($G push), scripts or
 Makefiles that run git, other binaries (hub, curl to the GitHub API, MCP tools), file writes by
-shell (echo > f, sed -i), and paths outside the root via `cd` in the same command. Unterminated
+shell (echo > f, sed -i) except onto the control files above, a refspec-less `git push` whose
+upstream is the base branch, and paths outside the root via `cd` in the same command. Unterminated
 quotes fall back to a cruder split that also over-matches. Heredoc detection tracks quotes,
 $(...) and ((...)) approximately; a mis-detected `<<` could hide the lines after it.
 """
 from __future__ import annotations
 
+import fnmatch
 import importlib.util
 import json
 import os
+import posixpath
 import re
 import shlex
 import sys
+from dataclasses import dataclass, field
+from urllib.parse import unquote
 
 FILE_TOOLS = {"Edit": "file_path", "Write": "file_path", "MultiEdit": "file_path",
               "NotebookEdit": "notebook_path"}
 SHELL_TOOLS = {"Bash", "PowerShell"}
-HUMAN_REASON = "Belay never merges, approves or force-pushes; a human does this."
+HUMAN_REASON = ("Belay never merges, approves, force-pushes, pushes to the base branch, deletes "
+                "remote branches or changes the owner's control labels (approved, stop, ready); "
+                "a human does this.")
+TAMPER_REASON = ("Belay denies changes to .belay/STOP, .belay/runs/ and .belay.toml: they are the "
+                 "owner's controls. Do not delete, move or edit them, and do not offer to. If the "
+                 "stop switch is on, pause the run (belay.py wait <run> --reason \"stop switch\") "
+                 "and tell the user. Run records change only through scripts/belay.py.")
 ERR_PREFIX = "belay hook: ignored internal error: "
 
 GIT_MUTATING = {"commit", "push", "merge", "rebase", "pull", "cherry-pick", "revert", "am"}
@@ -261,26 +281,147 @@ def _flags(args: list[str], opts_with_arg: set[str]) -> list[str]:
 
 GIT_PUSH_OPTS_WITH_ARG = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
 GH_REVIEW_OPTS_WITH_ARG = {"-b", "--body", "-F", "--body-file", "-R", "--repo"}
+GH_API_OPTS_WITH_ARG = GH_OPTS_WITH_ARG | {"-X", "--method", "-f", "-F", "--field", "--raw-field",
+                                           "-H", "--header", "--input", "--jq", "-q", "--template",
+                                           "-t", "--cache", "-p", "--preview"}
+GH_LABEL_MUTATING = {"create", "edit", "delete", "clone"}
+# Over-matches on purpose: `gh api repos/o/r/pulls/1/merge` without a method is the read-only
+# "is it merged?" GET, and it is denied too.
 _API_HUMAN_RE = re.compile(r"/merges?(?:$|[/?#])|mergePullRequest|enablePullRequestAutoMerge"
+                           r"|mergeBranch|updateRefs?\b|deleteRef\b|createCommitOnBranch"
                            r"|event\s*[=:]\s*[\"']?approve\b", re.I)
+_PUSH_HUMAN_FLAGS = {"--force", "--force-if-includes", "--mirror", "--delete", "--prune", "--all",
+                     "--branches"}
 
 
-def _classify_git(args: list[str]) -> tuple[bool, bool]:
+@dataclass(frozen=True)
+class Policy:
+    """Repository-specific names the classifier protects (all casefolded). The defaults apply
+    when no `.belay.toml` can be read; configured names are added to them, never replace them."""
+    base_branches: frozenset = frozenset({"main", "master"})
+    deny_add_labels: frozenset = frozenset({"belay:ready", "belay:approved", "belay:stop"})
+    deny_remove_labels: frozenset = frozenset({"belay:approved", "belay:stop"})
+    control_labels: frozenset = field(init=False)
+
+    def __post_init__(self):
+        object.__setattr__(self, "control_labels", self.deny_add_labels | self.deny_remove_labels)
+
+
+DEFAULT_POLICY = Policy()
+
+
+def _push_human(rest: list[str], policy: Policy) -> bool:
+    """Force pushes, mirror/all/prune pushes, remote branch deletions (`--delete`, `-d`, `:dst`)
+    and any push whose destination is a protected base branch (`main`, `HEAD:main`,
+    `x:refs/heads/main`, wildcard refspecs). A refspec-less `git push` is allowed: where it goes
+    depends on the current branch and its upstream, which the hook does not read."""
+    flags = _flags(rest, GIT_PUSH_OPTS_WITH_ARG)
+    if any(a in _PUSH_HUMAN_FLAGS or a.startswith(("--force-with-lease", "--force="))
+           or _short_has(a, "f") or _short_has(a, "d") for a in flags):
+        return True
+    if any(a.startswith("+") for a in rest):  # +refspec is a force push
+        return True
+    pos = [rest[i] for i in _positionals(rest, GIT_PUSH_OPTS_WITH_ARG)]
+    repo_flag = any(a == "--repo" or a.startswith("--repo=") for a in flags)
+    for ref in (pos if repo_flag else pos[1:]):
+        src, sep, dst = ref.partition(":")
+        if sep and not src.strip():
+            return True  # `:dst` deletes the remote branch
+        dst = (dst if sep else src).strip()
+        if dst.lower().startswith("refs/heads/"):
+            dst = dst[len("refs/heads/"):]
+        if "*" in dst or dst.casefold() in policy.base_branches:
+            return True
+    return False
+
+
+def _classify_git(args: list[str], policy: Policy = DEFAULT_POLICY) -> tuple[bool, bool]:
     pos = _positionals(args, GIT_OPTS_WITH_ARG)
     if not pos:
         return False, False
     sub = args[pos[0]].lower()
     rest = args[pos[0] + 1:]
-    human = sub == "push" and (
-        any(a in ("--force", "--force-if-includes", "--mirror")
-            or a.startswith(("--force-with-lease", "--force=")) or _short_has(a, "f")
-            for a in _flags(rest, GIT_PUSH_OPTS_WITH_ARG))
-        or any(a.startswith("+") for a in rest))  # +refspec is a force push
+    human = sub == "push" and _push_human(rest, policy)
     return human, sub in GIT_MUTATING
 
 
-def _classify_gh(args: list[str]) -> tuple[bool, bool]:
-    pos = [args[i].lower() for i in _positionals(args, GH_OPTS_WITH_ARG)]
+def _label_values(args: list[str]) -> list[tuple[str, str]]:
+    """(kind, label) pairs from --add-label/--label/-l (kind "add") and --remove-label ("remove"),
+    in both `--opt value` and `--opt=value` forms; comma lists are split; casefolded."""
+    out = []
+    for j, a in enumerate(args):
+        name, eq, val = a.partition("=")
+        if name not in ("--add-label", "--label", "-l", "--remove-label"):
+            continue
+        if not eq:
+            if j + 1 >= len(args):
+                continue
+            val = args[j + 1]
+        kind = "remove" if name == "--remove-label" else "add"
+        out += [(kind, v.strip().casefold()) for v in val.split(",") if v.strip()]
+    return out
+
+
+def _labels_human(args: list[str], policy: Policy) -> bool:
+    return any(lab in (policy.deny_add_labels if kind == "add" else policy.deny_remove_labels)
+               for kind, lab in _label_values(args))
+
+
+def _api_fields(args: list[str]) -> list[str]:
+    """Values of -f/-F/--field/--raw-field (`key=value`), in spaced, `=` and attached forms."""
+    out = []
+    for j, a in enumerate(args):
+        if a in ("-f", "-F", "--field", "--raw-field"):
+            if j + 1 < len(args):
+                out.append(args[j + 1])
+        elif a.startswith(("--field=", "--raw-field=")):
+            out.append(a.split("=", 1)[1])
+        elif len(a) > 2 and a[:2] in ("-f", "-F") and a[2] != "-":
+            out.append(a[2:])
+    return out
+
+
+def _classify_api(api_args: list[str], policy: Policy) -> tuple[bool, bool]:
+    human = any(_API_HUMAN_RE.search(a) or re.search(r"\bAPPROVE\b", a) for a in api_args)
+    method = "GET"
+    for j, a in enumerate(api_args):
+        if a in ("-X", "--method") and j + 1 < len(api_args):
+            method = api_args[j + 1].upper()
+        elif a.startswith("--method="):
+            method = a.split("=", 1)[1].upper()
+        elif a.startswith("-X") and len(a) > 2:
+            method = a[2:].upper()
+    fields = _api_fields(api_args)
+    has_input = any(a == "--input" or a.startswith("--input=") for a in api_args)
+    mutating = method != "GET" or bool(fields) or has_input
+    pos = _positionals(api_args, GH_API_OPTS_WITH_ARG)
+    path = unquote(api_args[pos[0]]).lower().split("?", 1)[0].strip("/") if pos else ""
+    # A body read from a file or stdin (`--input`, `key=@file`) cannot be inspected here.
+    opaque = has_input or any(f.partition("=")[2].startswith("@") for f in fields)
+    if path == "graphql" and opaque:
+        human = True
+    if re.search(r"(?:^|/)pulls/\d+/(?:reviews|merge)(?:/|$)|(?:^|/)merges$", path) and opaque:
+        human = True
+    if mutating and re.search(r"(?:^|/)(?:git/refs|contents)(?:/|$)", path):
+        human = True  # ref updates and file commits through the API bypass the push rules
+    labels_path = re.search(r"(?:^|/)labels(?:/|$)", path)
+    issue_path = re.search(r"(?:^|/)(?:issues|pulls)/\d+$", path)
+    if mutating and (labels_path or issue_path):
+        if opaque and (labels_path or method in ("PATCH", "POST", "PUT")):
+            human = True
+        if method in ("PUT", "DELETE") and re.search(r"(?:^|/)issues/\d+/labels$", path):
+            human = True  # replaces or clears every label, the stop label included
+        words = {w.strip("[]") for a in api_args
+                 for w in re.split(r"[=,/\s]+", unquote(a).casefold()) if w}
+        if (labels_path or any(f.lower().startswith("labels") for f in fields)) \
+                and words & policy.control_labels:
+            human = True
+    return human, mutating
+
+
+def _classify_gh(args: list[str], policy: Policy = DEFAULT_POLICY) -> tuple[bool, bool]:
+    idx = _positionals(args, GH_OPTS_WITH_ARG)
+    pos = [args[i].lower() for i in idx]
     if not pos:
         return False, False
     group = pos[0]
@@ -289,23 +430,19 @@ def _classify_gh(args: list[str]) -> tuple[bool, bool]:
         approve = action == "review" and any(
             a.startswith("--approve") or _short_has(a, "a")
             for a in _flags(args, GH_REVIEW_OPTS_WITH_ARG))
-        human = action == "merge" or approve
+        labels = action in ("edit", "create") and _labels_human(args, policy)
+        human = action == "merge" or approve or labels
         return human, action in GH_PR_MUTATING
     if group == "issue":
-        return False, action in GH_ISSUE_MUTATING
+        human = action in ("edit", "create") and _labels_human(args, policy)
+        return human, action in GH_ISSUE_MUTATING
+    if group == "label":
+        human = action in ("edit", "delete") and any(
+            part.strip().casefold() in policy.control_labels
+            for a in args[idx[1] + 1:] for part in a.split("="))
+        return human, action in GH_LABEL_MUTATING
     if group == "api":
-        human = any(_API_HUMAN_RE.search(a) or re.search(r"\bAPPROVE\b", a) for a in args)
-        method = "GET"
-        for j, a in enumerate(args):
-            if a in ("-X", "--method") and j + 1 < len(args):
-                method = args[j + 1].upper()
-            elif a.startswith("--method="):
-                method = a.split("=", 1)[1].upper()
-            elif a.startswith("-X") and len(a) > 2:
-                method = a[2:].upper()
-        has_fields = any(a in ("-f", "-F", "--field", "--raw-field", "--input")
-                         or a.startswith(("--field=", "--raw-field=", "--input=")) for a in args)
-        return human, method != "GET" or has_fields
+        return _classify_api(args[idx[0] + 1:], policy)
     return False, False
 
 
@@ -313,7 +450,8 @@ def _has_input_consumer(cmd: str) -> bool:
     return any(_prog(t) in HEREDOC_CONSUMERS for toks in _token_lists(cmd) for t in toks)
 
 
-def classify_command(cmd: str, depth: int = 0, keep_heredocs: bool = False) -> tuple[bool, bool]:
+def classify_command(cmd: str, depth: int = 0, keep_heredocs: bool = False,
+                     policy: Policy | None = None) -> tuple[bool, bool]:
     """(human_only, mutating) for a Bash/PowerShell command line.
 
     Heredoc bodies are dropped (they are data, e.g. a commit message) unless a shell or
@@ -321,6 +459,7 @@ def classify_command(cmd: str, depth: int = 0, keep_heredocs: bool = False) -> t
     source /dev/stdin <<EOF ...): then the bodies may be executed and are examined, at this
     level and in every nested $(...) / bash -c level below it.
     """
+    policy = policy or DEFAULT_POLICY
     human = mutating = False
     if depth > _MAX_DEPTH:
         return False, True  # absurd nesting: mutating (denied under STOP/budget), not human-only
@@ -335,18 +474,168 @@ def classify_command(cmd: str, depth: int = 0, keep_heredocs: bool = False) -> t
         progs = [_prog(t) for t in seg]
         for i, p in enumerate(progs):
             if p in ("git", "gh"):
-                h, m = (_classify_git if p == "git" else _classify_gh)(seg[i + 1:])
+                h, m = (_classify_git if p == "git" else _classify_gh)(seg[i + 1:], policy)
                 human, mutating = human or h, mutating or m
         for t in seg:
             if "$(" in t or "`" in t or (shell_call and re.search(r"\s", t)):
                 inner = t.replace("$(", ";").replace("`", ";").replace(")", ";")
-                h, m = classify_command(inner, depth + 1, keep_heredocs)
+                h, m = classify_command(inner, depth + 1, keep_heredocs, policy)
                 human, mutating = human or h, mutating or m
         if any(p in SHELL_INVOKERS for p in progs):
-            h, m = (classify_command(" ".join(seg[1:]), depth + 1, keep_heredocs)
+            h, m = (classify_command(" ".join(seg[1:]), depth + 1, keep_heredocs, policy)
                     if len(seg) > 1 else (False, False))
             human, mutating = human or h, mutating or m
     return human, mutating
+
+
+# ---------------------------------------------------------------------------
+# Owner's control files (.belay/STOP, .belay/runs/, .belay.toml)
+# ---------------------------------------------------------------------------
+
+# Commands that only read: naming a control file with one of these is fine. Anything else that
+# names one (rm, mv, cp, sed, tee, Set-Content, an interpreter, a wrapper such as sudo ...) is
+# denied: unknown verbs fail closed.
+_READ_ONLY = {"ls", "dir", "cat", "type", "head", "tail", "less", "more", "stat", "file", "wc",
+              "test", "[", "[[", "echo", "printf", "grep", "egrep", "fgrep", "rg", "tree", "du",
+              "realpath", "readlink", "basename", "dirname", "diff", "cmp", "md5sum", "sha1sum",
+              "sha256sum", "find", "get-content", "gc", "get-item", "gi", "get-childitem", "gci",
+              "test-path", "get-itemproperty", "gp", "select-string", "sls", "resolve-path",
+              "rvpa", "write-output", "write-host", "get-filehash", "true", "false"}
+_GIT_READ = {"status", "diff", "log", "show", "blame", "ls-files", "ls-tree", "check-ignore",
+             "rev-parse", "grep", "cat-file", "add", "commit"}
+_FIND_WRITES = ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fls")
+_INTERPRETERS = {"python", "python3", "py", "pythonw", "node", "perl", "ruby", "php", "deno",
+                 "bun", "lua", "awk", "gawk", "sed", "osascript"}
+# Verbs that write or execute: if a control file is named anywhere in the command (even by a
+# reader, as in `ls .belay | xargs rm`), one of these elsewhere in it is denied too.
+_WRITERS = {"rm", "rmdir", "unlink", "del", "erase", "rd", "mv", "move", "ren", "rename", "cp",
+            "copy", "dd", "tee", "truncate", "shred", "install", "ln", "xargs", "touch", "mkdir",
+            "remove-item", "ri", "move-item", "mi", "rename-item", "rni", "copy-item", "cpi",
+            "set-content", "sc", "add-content", "ac", "clear-content", "clc", "out-file",
+            "new-item", "ni", "clear-item", "cli", "set-item", "si"} | _INTERPRETERS | SHELL_INVOKERS
+_PIECE_SPLIT = re.compile(r"[\s'\"(){};,<>|&=`]+")
+_GLOB_CHARS = "*?["
+
+
+def _comp_is(comp: str, name: str) -> bool:
+    """A path component equals `name`, or is a glob that matches it. A glob only matches a
+    dot-name when it starts with a dot itself (as in bash: `*` skips dotfiles)."""
+    if comp == name:
+        return True
+    return (any(c in comp for c in _GLOB_CHARS) and (comp.startswith(".") or not name.startswith("."))
+            and fnmatch.fnmatchcase(name, comp))
+
+
+def _control_piece(piece: str, prefix: str) -> bool:
+    """Does this word name `.belay` itself, `.belay/STOP`, `.belay/runs[/...]` or `.belay.toml`?
+    Case-insensitive, `\\` as `/`, `..` resolved; relative words are also tried against the
+    command's cwd (`prefix`, relative to the footprint root) so `rm STOP` inside `.belay/` counts."""
+    p = piece.replace("\\", "/").strip().lower()
+    if not p:
+        return False
+    cands = [p]
+    if prefix and not p.startswith(("/", "~", "$")) and not re.match(r"^[a-z]:", p):
+        cands.append(prefix + "/" + p)
+    for c in cands:
+        comps = [x for x in posixpath.normpath(c).split("/") if x]
+        for i, comp in enumerate(comps):
+            if _comp_is(comp, ".belay.toml"):
+                return True
+            if _comp_is(comp, ".belay"):
+                if i == len(comps) - 1:
+                    return True
+                if _comp_is(comps[i + 1], "stop") or _comp_is(comps[i + 1], "runs"):
+                    return True
+    return False
+
+
+def _words(seg: list[str]) -> list[str]:
+    """The segment without leading `VAR=x` assignments (and a PowerShell `$v =`)."""
+    i = 0
+    while i < len(seg) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[i]):
+        i += 1
+    if i + 1 < len(seg) and seg[i].startswith("$") and seg[i + 1] == "=":
+        i += 2
+    return seg[i:]
+
+
+def _is_belay_helper(words: list[str]) -> bool:
+    """`python[3] [-opts] .../belay.py ...`: the helper changes run records under its own lock."""
+    rest = [w for w in words[1:] if not w.startswith("-")]
+    return bool(rest) and _prog(rest[0]) == "belay.py"
+
+
+def _seg_read_only(words: list[str]) -> bool:
+    if not words:
+        return True
+    w = _prog(words[0])
+    if w == "git":
+        pos = _positionals(words[1:], GIT_OPTS_WITH_ARG)
+        return bool(pos) and words[1 + pos[0]].lower() in _GIT_READ
+    if w == "gh":
+        return True
+    if w == "find":
+        return not any(t.lower().startswith(_FIND_WRITES) for t in words[1:])
+    if w in _INTERPRETERS:
+        return _is_belay_helper(words)
+    return w in _READ_ONLY
+
+
+def _segments_with_punct(tokens: list[str]) -> list[tuple[str, list[str]]]:
+    segs, cur, punct = [], [], ""
+    for t in tokens:
+        if t and all(c in _PUNCT for c in t):
+            if cur:
+                segs.append((punct, cur))
+            cur, punct = [], t
+        else:
+            cur.append(t)
+    if cur:
+        segs.append((punct, cur))
+    return segs
+
+
+def touches_controls(cmd: str, prefix: str = "", depth: int = 0, keep_heredocs: bool = False) -> bool:
+    """True if a shell command looks like it changes `.belay/STOP`, `.belay/runs/` or `.belay.toml`.
+
+    BEST EFFORT, over-matching: a segment that names a control file (after quotes, `\\`, `..`,
+    globs such as `.b*/S*`, and the cwd are taken into account) is denied unless its verb only
+    reads (ls, cat, test, grep, Get-Content, Test-Path, read-only git, gh, the belay.py helper
+    ...); output redirection onto one is denied; and a command that names one anywhere is denied
+    if it also runs a writer, shell or interpreter (`ls .belay | xargs rm`). Quoted text with
+    spaces is data for git and gh (commit messages, bodies) and is split into words for every
+    other verb. Not detected: paths built from variables ($D/STOP), a `cd` into `.belay` in an
+    earlier tool call, scripts that delete files, and `git clean`.
+    """
+    if depth > _MAX_DEPTH:
+        return False
+    stripped = strip_heredocs(cmd)
+    keep_heredocs = keep_heredocs or _has_input_consumer(stripped)
+    if not keep_heredocs:
+        cmd = stripped
+    for toks in _token_lists(cmd):
+        named_any = writer_any = False
+        for punct, seg in _segments_with_punct(toks):
+            if punct in ("<", "<<<"):
+                continue  # the file an input redirection reads
+            words = _words(seg)
+            w = _prog(words[0]) if words else ""
+            pieces = [p for t in words if not (w in ("git", "gh") and re.search(r"\s", t))
+                      for p in _PIECE_SPLIT.split(t) if p]
+            named = any(_control_piece(p, prefix) for p in pieces)
+            read_only = _seg_read_only(words)
+            if named and not read_only:
+                return True
+            named_any = named_any or named
+            writer_any = writer_any or (w in _WRITERS and not read_only)
+            for t in seg:
+                if "$(" in t or "`" in t:
+                    inner = t.replace("$(", ";").replace("`", ";").replace(")", ";")
+                    if touches_controls(inner, prefix, depth + 1, keep_heredocs):
+                        return True
+        if named_any and writer_any:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +727,35 @@ def _deny(reason: str) -> str:
 def _stop_reason(root: str) -> str:
     return (f"Belay stop switch is on ({os.path.join(root, '.belay', 'STOP')} exists): file edits, "
             "commits, pushes, merges and tracker changes are paused. Read-only commands still "
-            "work. To resume, the owner deletes .belay/STOP (for example: rm .belay/STOP).")
+            "work. Only the owner clears the stop switch, outside this session. Do not delete, "
+            "move or edit .belay/STOP and do not offer to: pause the run (belay.py wait <run> "
+            "--reason \"stop switch\") and tell the user the switch is on.")
+
+
+def _policy(roots: list[str]) -> Policy:
+    """Protected names for these footprints: defaults plus each root's configured base branch
+    and labels. A config that cannot be read keeps the defaults (the human-only rules must not
+    fail open because of a typo in .belay.toml)."""
+    base, add, rem = (set(DEFAULT_POLICY.base_branches), set(DEFAULT_POLICY.deny_add_labels),
+                      set(DEFAULT_POLICY.deny_remove_labels))
+    for rt in roots:
+        try:
+            cfg, _ = _load_helper().load_config(os.path.join(rt, ".belay.toml"))
+        except Exception:
+            continue
+        base.add(cfg.base_branch.strip().casefold())
+        add |= {cfg.labels[n].strip().casefold() for n in ("ready", "approved", "stop")}
+        rem |= {cfg.labels[n].strip().casefold() for n in ("approved", "stop")}
+    return Policy(frozenset(base), frozenset(add), frozenset(rem))
+
+
+def _cwd_prefix(cwd: str, root: str) -> str:
+    """cwd relative to root with `/` separators; "" at the root or outside it."""
+    try:
+        rel = os.path.relpath(_canon(cwd), _canon(root)).replace("\\", "/")
+    except ValueError:
+        return ""
+    return "" if rel == "." or rel == ".." or rel.startswith("../") else rel
 
 
 def _budget_reason(helper, root: str, now) -> str | None:
@@ -475,7 +792,6 @@ def decide(data: dict, now) -> str | None:
     r = find_root(cwd)
     if r:
         roots.append(r)
-    human = False
     target = None
     if tool in FILE_TOOLS:
         target = tool_input.get(FILE_TOOLS[tool]) or tool_input.get("file_path")
@@ -489,27 +805,28 @@ def decide(data: dict, now) -> str | None:
         cmd = tool_input.get("command")
         if not isinstance(cmd, str):
             raise ValueError(f"{tool} without a command string")
-        human, mutating = classify_command(cmd)
-        if not mutating and not human:
-            return None
     if not roots:
         return None
-    if human:
-        return HUMAN_REASON
 
-    # Files under .belay/ stay editable so the owner can clear STOP, except run records, which
-    # change only through scripts/belay.py (guarded like any other edit).
-    def exempt(rt: str) -> bool:
-        return (target is not None and _under_belay(target, rt)
-                and not _under_belay(target, rt, "runs"))
+    if target is None:
+        # The owner's control files: denied in any footprint, STOP or not.
+        if any(touches_controls(cmd, _cwd_prefix(cwd, rt)) for rt in roots):
+            return TAMPER_REASON
+        human, mutating = classify_command(cmd, policy=_policy(roots))
+        if human:
+            return HUMAN_REASON
+        if not mutating:
+            return None
+    elif any(_under_belay(target, rt, "runs")
+             or _canon(target) == _canon(os.path.join(rt, ".belay.toml")) for rt in roots):
+        return TAMPER_REASON
 
-    runs_note = ""
-    if target is not None and any(_under_belay(target, rt, "runs") for rt in roots):
-        runs_note = " Run records under .belay/runs/ change only through scripts/belay.py."
-    mutating_roots = [rt for rt in roots if not exempt(rt)]
+    # Other files under .belay/ (STOP, tmp/) stay editable, so the owner can create STOP and
+    # skills can write body files.
+    mutating_roots = [rt for rt in roots if not (target is not None and _under_belay(target, rt))]
     for rt in mutating_roots:
         if os.path.exists(os.path.join(rt, ".belay", "STOP")):
-            return _stop_reason(rt) + runs_note
+            return _stop_reason(rt)
     if not mutating_roots:
         return None
     helper = _load_helper()
@@ -519,7 +836,7 @@ def decide(data: dict, now) -> str | None:
     for rt in mutating_roots:
         reason = _budget_reason(helper, rt, now)
         if reason:
-            return reason + runs_note
+            return reason
     return None
 
 

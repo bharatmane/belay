@@ -13,7 +13,8 @@ import belay as b  # noqa: E402
 import belay_hook as h  # noqa: E402
 
 NOW = datetime(2026, 11, 7, 12, 0, 0, tzinfo=timezone.utc)
-HUMAN = "Belay never merges, approves or force-pushes; a human does this."
+HUMAN = "a human does this."
+TAMPER = "owner's controls"
 
 
 def event(tool, cwd, **tool_input):
@@ -102,11 +103,14 @@ class TestStop(HookBase):
         super().setUp()
         self.stop()
 
-    def test_edit_denied_and_reason_says_how_to_clear(self):
+    def test_edit_denied_and_reason_tells_model_not_to_clear(self):
         reason = self.assertDeny(self.run_hook("Edit", file_path=str(self.root / "a.py"),
                                                old_string="a", new_string="b"))
         self.assertIn(".belay/STOP", reason)
-        self.assertIn("delete", reason.lower())
+        self.assertIn("Do not delete", reason)
+        self.assertIn("owner", reason)
+        self.assertNotIn("rm ", reason)
+        self.assertNotIn("for example", reason)
 
     def test_all_file_tools_denied(self):
         for tool, key in (("Write", "file_path"), ("MultiEdit", "file_path"),
@@ -141,9 +145,9 @@ class TestStop(HookBase):
     def test_ls_allowed(self):
         self.assertAllow(self.bash("ls"))
 
-    def test_rm_stop_file_allowed(self):
-        self.assertAllow(self.bash("rm .belay/STOP"))
-        self.assertAllow(self.run_hook("PowerShell", command="Remove-Item .belay/STOP"))
+    def test_rm_stop_file_denied(self):
+        self.assertDeny(self.bash("rm .belay/STOP"), TAMPER)
+        self.assertDeny(self.run_hook("PowerShell", command="Remove-Item .belay/STOP"), TAMPER)
 
     def test_read_only_git_and_gh_allowed(self):
         for cmd in ("git status", "git log --oneline -5", "git diff HEAD~1", "git show HEAD",
@@ -172,7 +176,7 @@ class TestStop(HookBase):
                     "gh -R o/r issue close 3", "gh issue close 3 -R o/r",
                     "gh api -X POST repos/o/r/issues", "gh api repos/o/r/issues -f title=x",
                     "gh api --method PATCH repos/o/r/issues/1", "echo 'git push' | sh",
-                    "git pu`sh"):
+                    "git pu`sh", "gh label create bug", "gh label delete old"):
             with self.subTest(cmd=cmd):
                 self.assertDeny(self.bash(cmd))
 
@@ -320,9 +324,10 @@ class TestRunRecords(HookBase):
         self.assertDeny(self.run_hook("Edit", file_path=self.runs_file(), old_string="a",
                                       new_string="b"), "scripts/belay.py")
 
-    def test_runs_dir_allowed_when_healthy(self):
+    def test_runs_dir_denied_even_when_healthy(self):
         self.make_run(active_seconds=60)
-        self.assertAllow(self.run_hook("Write", file_path=self.runs_file(), content="{}"))
+        self.assertDeny(self.run_hook("Write", file_path=self.runs_file(), content="{}"),
+                        TAMPER, "scripts/belay.py")
 
 
 class TestBudget(HookBase):
@@ -397,6 +402,209 @@ class TestFailOpen(HookBase):
         (self.root / ".belay" / "runs").mkdir()
         (self.root / ".belay" / "runs" / "bad.json").write_text("{", encoding="utf-8")
         self.assertDeny(self.bash("git push"), "STOP")
+
+
+class TestControlFiles(HookBase):
+    """C1: shell commands that change .belay/STOP, .belay/runs/ or .belay.toml are denied in a
+    footprint, with or without STOP (best-effort pattern match)."""
+
+    def setUp(self):
+        super().setUp()
+        self.footprint()
+
+    def test_tamper_commands_denied(self):
+        root = str(self.root)
+        for cmd in ("rm .belay/STOP", "rm -f ./.belay/STOP", "del .belay\\STOP", "erase .belay\\STOP",
+                    "mv .belay/STOP /tmp/x", "rm -rf .belay", "rm -r .belay/runs/",
+                    "rm .belay/runs/x.json", "echo '{}' > .belay/runs/x.json",
+                    "echo x >> .belay.toml", "echo x>.belay.toml", "sed -i 's/60/0/' .belay.toml",
+                    "truncate -s 0 .belay.toml", "python -c \"import os; os.remove('.belay/STOP')\"",
+                    "bash -c 'rm .belay/STOP'", "echo \"$(rm .belay/STOP)\"", "rm .b*/S*",
+                    "rm .belay/*", f"rm {root}/.belay/STOP", f"rm \"{root}\\.belay\\STOP\"",
+                    "cd .belay && rm STOP", "ls .belay | xargs rm", "git checkout -- .belay.toml",
+                    "git rm --cached .belay.toml", "cp x .belay.toml", "rm src/../.belay/STOP",
+                    "echo rm .belay/STOP | sh", "unlink .belay/STOP", "sudo rm .BELAY/stop",
+                    "tee .belay.toml < x", "find .belay -name STOP -delete",
+                    "rm .belay/runs/../STOP", "python3 - <<'EOF'\nimport os\nEOF\nrm .belay/STOP"):
+            with self.subTest(cmd=cmd):
+                self.assertDeny(self.bash(cmd), TAMPER)
+
+    def test_powershell_tamper_denied(self):
+        for cmd in ("Remove-Item .belay/STOP", "Remove-Item -Force .belay\\STOP",
+                    "ri .belay\\STOP", "Move-Item .belay/STOP x", "Rename-Item .belay\\STOP x",
+                    "Set-Content .belay.toml 'idle_minutes = 0'", "Clear-Content .belay.toml",
+                    "'x' | Out-File .belay.toml", "Remove-Item -Recurse .belay\\runs"):
+            with self.subTest(cmd=cmd):
+                self.assertDeny(self.run_hook("PowerShell", command=cmd), TAMPER)
+
+    def test_reason_says_do_not_touch(self):
+        reason = self.assertDeny(self.bash("rm .belay/STOP"), TAMPER)
+        self.assertIn("Do not", reason)
+        self.assertNotIn("rm ", reason)
+
+    def test_cwd_inside_belay_dir_resolves_bare_names(self):
+        (self.root / ".belay" / "runs").mkdir()
+        for cmd in ("rm STOP", "rm runs/x.json", "rm -r *"):
+            with self.subTest(cmd=cmd):
+                code, out, err = h.main(event("Bash", self.root / ".belay", command=cmd), now=NOW)
+                self.assertIn("deny", out, err)
+
+    def test_reads_and_unrelated_paths_allowed(self):
+        for cmd in ("ls .belay", "ls -la .belay/runs", "cat .belay/STOP", "cat .belay.toml",
+                    "test -f .belay/STOP && echo stopped", "git -C . check-ignore -q .belay/",
+                    "grep idle .belay.toml", "mkdir -p .belay/tmp", "rm .belay/tmp/x.md",
+                    "git commit -m 'docs: explain .belay/STOP'", "cat < .belay/STOP",
+                    "python scripts/belay.py --config .belay.toml status", "rm -rf build/*",
+                    "rm notes.belay", "echo see .belay/STOP", "git status .belay.toml",
+                    "head -n 5 .belay/runs/x.json", "rm .belayx/STOP", "git add .belay.toml"):
+            with self.subTest(cmd=cmd):
+                self.assertAllow(self.bash(cmd))
+        for cmd in ("Test-Path .belay/STOP", "Get-Content .belay.toml",
+                    "Get-ChildItem .belay\\runs"):
+            with self.subTest(cmd=cmd):
+                self.assertAllow(self.run_hook("PowerShell", command=cmd))
+
+    def test_file_tools_on_config_and_runs_denied_stop_file_allowed(self):
+        self.assertDeny(self.run_hook("Write", file_path=str(self.root / ".belay.toml"),
+                                      content="idle_minutes = 0\n"), TAMPER)
+        self.assertDeny(self.run_hook("Edit", file_path=str(self.root / ".belay" / "runs" / "a.json"),
+                                      old_string="a", new_string="b"), TAMPER)
+        self.assertAllow(self.run_hook("Write", file_path=str(self.root / ".belay" / "STOP"),
+                                       content=""))
+        self.assertAllow(self.run_hook("Write", file_path=str(self.root / ".belay" / "tmp" / "x.md"),
+                                       content=""))
+
+    def test_no_footprint_no_opinion(self):
+        (self.root / ".belay").rmdir()
+        self.assertAllow(self.bash("rm .belay/STOP"))
+        self.assertAllow(self.bash("rm .belay.toml"))
+
+
+class TestBaseBranchPush(HookBase):
+    """I1: pushes to the base branch and remote branch deletions are human-only."""
+
+    def setUp(self):
+        super().setUp()
+        self.footprint()
+
+    def test_push_to_base_or_delete_denied(self):
+        for cmd in ("git push origin HEAD:main", "git push origin main", "git push origin main:main",
+                    "git push origin feat:refs/heads/main", "git push origin HEAD:refs/heads/main",
+                    "git push origin :feature", "git push --delete origin feat",
+                    "git push origin --delete feat", "git push -d origin feat",
+                    "git push origin HEAD:master", "git push --prune origin",
+                    "git push origin 'refs/heads/*:refs/heads/*'", "git push --all origin",
+                    "git -C x push origin HEAD:Main", "git push --repo origin main",
+                    "git push -u origin feat main"):
+            with self.subTest(cmd=cmd):
+                self.assertDeny(self.bash(cmd), HUMAN)
+                self.assertEqual(h.classify_command(cmd)[0], True)
+
+    def test_feature_pushes_allowed(self):
+        for cmd in ("git push", "git push origin", "git push -u origin belay/20261107-7",
+                    "git push origin HEAD:belay/x", "git push origin mainline",
+                    "git push origin feature/main", "git push --set-upstream origin feat",
+                    "git push origin HEAD"):
+            with self.subTest(cmd=cmd):
+                self.assertAllow(self.bash(cmd))
+
+    def test_configured_base_branch(self):
+        (self.root / ".belay.toml").write_text('base_branch = "develop"\n', encoding="utf-8")
+        self.assertDeny(self.bash("git push origin HEAD:develop"), HUMAN)
+        self.assertDeny(self.bash("git push origin main"), HUMAN)  # main/master always protected
+        self.assertAllow(self.bash("git push origin HEAD:feat"))
+
+    def test_bad_config_still_protects_main(self):
+        (self.root / ".belay.toml").write_text("tracker = 3\n", encoding="utf-8")
+        self.assertDeny(self.bash("git push origin HEAD:main"), HUMAN)
+
+
+class TestControlLabels(HookBase):
+    """I2: adding/removing the approved and stop labels (and adding ready) is human-only."""
+
+    def setUp(self):
+        super().setUp()
+        self.footprint()
+
+    def test_control_label_changes_denied(self):
+        for cmd in ("gh issue edit 14 --add-label belay:approved",
+                    "gh issue edit 14 --add-label 'bug,Belay:Approved'",
+                    "gh issue edit 14 --add-label=belay:approved",
+                    "gh issue edit 14 --remove-label belay:stop",
+                    "gh issue edit 14 --remove-label belay:approved",
+                    "gh issue edit 14 --add-label belay:stop",
+                    "gh issue edit 14 --add-label belay:ready",
+                    "gh -R o/r issue edit 14 --remove-label ' belay:stop '",
+                    "gh issue create -t x --label belay:ready", "gh issue create -t x -l belay:approved",
+                    "gh pr edit 14 --add-label belay:approved",
+                    "gh label delete belay:stop", "gh label edit belay:review --name belay:approved",
+                    "gh label edit belay:approved --name x",
+                    "gh api -X POST repos/o/r/issues/14/labels -f 'labels[]=belay:approved'",
+                    "gh api repos/o/r/issues/14/labels -f 'labels[]=belay:approved'",
+                    "gh api -X DELETE repos/o/r/issues/14/labels/belay:stop",
+                    "gh api -X DELETE repos/o/r/issues/14/labels/belay%3Astop",
+                    "gh api -X PUT repos/o/r/issues/14/labels -f 'labels[]=bug'",
+                    "gh api -X DELETE repos/o/r/issues/14/labels",
+                    "gh api repos/o/r/issues/14/labels --input l.json",
+                    "gh api -X PATCH repos/o/r/labels/belay:review -f new_name=belay:approved",
+                    "gh api -X PATCH repos/o/r/issues/14 -f 'labels[]=belay:approved'"):
+            with self.subTest(cmd=cmd):
+                self.assertDeny(self.bash(cmd), HUMAN)
+
+    def test_state_labels_allowed(self):
+        for cmd in ("gh issue edit 14 --add-label belay:working --remove-label belay:ready",
+                    "gh issue edit 14 --add-label belay:review --remove-label belay:working",
+                    "gh issue edit 14 --add-label belay:waiting --remove-label belay:working",
+                    "gh issue edit 14 --add-label belay:failed --remove-label belay:working",
+                    "gh issue edit 3 --add-label bug", "gh issue create -t x --label bug",
+                    "gh label create bug", "gh issue comment 14 -b 'please add belay:approved'",
+                    "gh api -X POST repos/o/r/issues/14/labels -f 'labels[]=belay:working'"):
+            with self.subTest(cmd=cmd):
+                self.assertAllow(self.bash(cmd))
+
+    def test_configured_label_names(self):
+        (self.root / ".belay.toml").write_text('[labels]\napproved = "ok-to-build"\n',
+                                               encoding="utf-8")
+        self.assertDeny(self.bash("gh issue edit 1 --add-label OK-to-build"), HUMAN)
+        self.assertDeny(self.bash("gh issue edit 1 --add-label belay:approved"), HUMAN)
+
+
+class TestApiBodies(HookBase):
+    """I6: gh api writes whose body cannot be inspected are human-only where it matters."""
+
+    def setUp(self):
+        super().setUp()
+        self.footprint()
+
+    def test_uninspectable_or_ref_writes_denied(self):
+        for cmd in ("gh api graphql -F query=@m.graphql", "gh api graphql --input q.json",
+                    "gh api graphql --input=q.json", "gh api graphql -F query=@-",
+                    "gh api graphql -f query=@m.graphql", "gh api graphql --field=query=@m.graphql",
+                    "gh api repos/o/r/pulls/1/reviews --input body.json",
+                    "gh api repos/o/r/pulls/1/reviews -F body=@b.md -f event=COMMENT",
+                    "gh api repos/o/r/pulls/1/reviews/9/events --input e.json",
+                    "gh api -X PUT repos/o/r/pulls/1/merge --input m.json",
+                    "gh api repos/o/r/merges --input m.json",
+                    "gh api repos/o/r/git/refs/heads/main -X PATCH -F force=true",
+                    "gh api -X POST repos/o/r/git/refs -f ref=refs/heads/x -f sha=abc",
+                    "gh api -X DELETE repos/o/r/git/refs/heads/feat",
+                    "gh api -X PUT repos/o/r/contents/a.py -f message=m -f content=eA== -f branch=main",
+                    "gh api graphql -f query='mutation { mergeBranch(input: {}) { x } }'",
+                    "gh api graphql -f query='mutation { updateRef(input: {force: true}) { x } }'",
+                    "gh api graphql -f query='mutation { createCommitOnBranch(input: {}) { x } }'"):
+            with self.subTest(cmd=cmd):
+                self.assertDeny(self.bash(cmd), HUMAN)
+
+    def test_inspectable_and_documented_calls_allowed(self):
+        q = ("gh api graphql -f query='query($owner:String!,$name:String!,$number:Int!){repository"
+             "(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){nodes"
+             "{isResolved}}}}}' -f owner=o -f name=r -F number=5")
+        for cmd in (q, "gh api -X POST repos/o/r/pulls/5/comments -f commit_id=a -f path=x "
+                       "-F line=3 -f side=RIGHT -F body=@.belay/tmp/review-5-1.md",
+                    "gh api repos/o/r/git/refs/heads/main", "gh api user --jq .login",
+                    "gh api repos/o/r/pulls/5/reviews -f event=COMMENT -f body=ok"):
+            with self.subTest(cmd=cmd):
+                self.assertAllow(self.bash(cmd))
 
 
 class TestScriptAndConfig(unittest.TestCase):

@@ -14,7 +14,7 @@ import belay as b  # noqa: E402
 import belay_hook as h  # noqa: E402
 
 NOW = datetime(2026, 11, 7, 12, 0, 0, tzinfo=timezone.utc)
-HUMAN = "Belay never merges, approves or force-pushes; a human does this."
+HUMAN = h.HUMAN_REASON
 
 
 def _git(cwd, *args):
