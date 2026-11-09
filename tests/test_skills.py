@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT / "evals" / "harness"))
 import fake_gh  # noqa: E402
 import pr_fixtures  # noqa: E402
 
-SCENARIOS = set(fake_gh.SCENARIOS) | set(pr_fixtures.SCENARIOS)
+SCENARIOS = set(fake_gh.SCENARIOS) | set(pr_fixtures.SCENARIOS) | set(fake_gh.DISPATCH)
 
 
 def eval_files():
