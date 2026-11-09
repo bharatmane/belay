@@ -211,8 +211,24 @@ and delete `<sandbox>/.belay/`. Keep or delete the scratch repository as you lik
 
 ## Results
 
-Pending: to be run by the owner against a private scratch repo (suggested name
-belay-sandbox).
+### 2026-11-09: partial run against `bharatmane/belay-sandbox` (public)
+
+Versions: Claude Code 2.1.319, Python 3.14, belay `0.1.0-dev` at `main` (c9af76a plus the fix below).
+Run by the assistant from the helper and real `gh`, not from a Claude Code session.
+
+| case | result |
+|---|---|
+| `claim` against a real issue, `check-paths`, `evidence`, `hand-off` | pass |
+| label swap `belay:ready` -> `working` -> `review` with real `gh` | pass |
+| `gh pr create --draft --body-file`: PR is a draft and `closingIssuesReferences` links issue #1 | pass |
+| worktree off `main`, tests first, push of the feature branch | pass |
+| `gh issue list --label belay:ready` right after creating the issue | empty for a few seconds (GitHub search lag); found after ~20 s. `find_ready` can miss a just-created issue; retry later |
+| repeated `--changed` in `check-paths` | **defect**: only the last group was checked, so a high-risk path in an earlier group passed. Fixed with a failing test first |
+
+Still pending, needs an interactive Claude Code session (a headless `claude -p` launch is
+blocked by the permission classifier): that the installed plugin's hook loads and its deny is
+honoured, `/hooks` and `/belay:dispatch` appear, the Windows `python3 || python` fallback,
+and the stop-file, budget and no-evidence cases end to end through a real model.
 
 Each run adds an entry: date, the four versions from [Before you start](#before-you-start),
 one line per case (pass, or what happened instead), and the commit of any fix.
