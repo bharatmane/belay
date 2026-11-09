@@ -4,7 +4,7 @@
 
 tracker = "github"            # "github" ("jira" is planned, not yet supported)
 base_branch = "main"          # branch that worktrees start from and PRs target
-idle_minutes = 60             # idle time beyond this is not credited; older heartbeats are stale
+idle_minutes = 60             # >= 1; idle time beyond this is not credited; older heartbeats are stale
 high_risk_paths = []          # globs that need the approved label, e.g. ["migrations/**", "src/auth/"]
 test_command = ""             # what "tests pass" means here, e.g. "python -m pytest -q"
 owner = ""                    # GitHub login allowed to extend or reopen runs; empty = nobody

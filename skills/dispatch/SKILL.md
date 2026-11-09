@@ -119,7 +119,7 @@ Step detail and the exact shell forms: [stages](references/stages.md).
 
 | Exit | What happened | Do this, then stop |
 |---|---|---|
-| 3 | Stop switch: `.belay/STOP` or the stop label | With a run: `B wait <run> --reason "stop switch"`. No comment, no label. Tell the user the switch is on and that **they** clear it (delete `.belay/STOP` or remove the label); then the run continues with `resume`. Never clear it yourself or offer to. |
+| 3 | Stop switch: `.belay/STOP` or the stop label | With a run: `B wait <run> --reason "stop switch"`. No comment, no label. Tell the user the switch is on and that **they** clear it (delete `.belay/STOP` or remove the label); then they continue it by typing `/belay:dispatch resume #<n>`. Never clear it yourself or offer to. |
 | 4 | Budget or a stage's attempts spent | Escape hatch: `B fail <run> --reason "<limit>"`, then the [escape-hatch comment](../../shared/templates/escape-hatch.md), then `belay:failed`. Never extend. |
 | 5 | Another run is working | Name it and its issue. Touch nothing. |
 | 7 | No passing evidence for HEAD | Run the real test command on this commit, record it, retry `hand-off`. That rerun is an attempt. |

@@ -42,7 +42,7 @@ PreToolUse hook, **skills** means the instructions in the skills and adapters.
 |---|---|---|---|---|---|
 | `tracker` | string | `"github"` | `"github"` or `"jira"` | skills; stored in each run record | Where issues live. Only `"github"` works today; the [Jira adapter](adapters/jira.md) is planned. |
 | `base_branch` | string | `"main"` | none | skills | Branch worktrees start from and PRs target. |
-| `idle_minutes` | integer | `60` | `>= 0` | helper | A gap between heartbeats longer than this is credited as only this many minutes, and a `working` run whose last heartbeat is older is stale: the next `claim` recovers it. |
+| `idle_minutes` | integer | `60` | `>= 1` | helper | A gap between heartbeats longer than this is credited as only this many minutes, and a `working` run whose last heartbeat is older is stale: the next `claim` recovers it, stamping a fresh heartbeat so the downtime is not charged. |
 | `high_risk_paths` | list of strings | `[]` | each entry non-blank after trimming; no `[` | helper (`check-paths`) | Globs whose changes need the approved label (see below). |
 | `test_command` | string | `""` | none | helper (`hand-off`); skills | What "tests pass" means. When set, `hand-off` accepts only evidence recorded with exactly this command string. When empty, any passing command counts. |
 | `owner` | string | `""` | trimmed | helper (`override`) | GitHub login allowed to extend or reopen a run, compared case-insensitively. Empty means nobody can (exit code 9). |

@@ -61,6 +61,26 @@ class SkillStructure(unittest.TestCase):
         for ref in ("stages.md", "resume-and-limits.md"):
             self.assertTrue((skill / "references" / ref).is_file(), ref)
 
+    def test_dispatch_evals_and_docs_use_the_slash_command(self):
+        data = json.loads((ROOT / "evals" / "dispatch.json").read_text(encoding="utf-8"))
+        self.assertTrue(all(p.startswith("/belay:dispatch") for p in data["should_trigger"]))
+        self.assertGreaterEqual(len(data["must_not_auto_load"]), 3)
+        self.assertFalse(any(p.startswith("/") for p in data["must_not_auto_load"]))
+        for rel in ("README.md", "skills/dispatch/references/resume-and-limits.md"):
+            text = (ROOT / rel).read_text(encoding="utf-8")
+            self.assertIn("/belay:dispatch resume #", text, rel)
+            self.assertNotIn("(\"resume the belay run for", text, rel)
+
+    def test_security_policy_present_without_personal_email(self):
+        import re
+        text = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
+        self.assertIn("Report a vulnerability", text)
+        self.assertIsNone(re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", text))
+
+    def test_plugin_keywords_do_not_advertise_jira(self):
+        data = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        self.assertNotIn("jira", [k.lower() for k in data["keywords"]])
+
     def test_dispatch_uses_only_real_helper_commands(self):
         import re
         sys.path.insert(0, str(ROOT / "scripts"))

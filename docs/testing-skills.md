@@ -16,13 +16,14 @@ candidate for deletion.
 
 ## The eval file
 
-Each skill has `evals/<skill>.json` with four keys:
+Each skill has `evals/<skill>.json` with four required keys (plus optional `must_not_auto_load` and `notes`):
 
 | Key | What it holds |
 |---|---|
 | `skill` | The skill name; must equal the file name. |
 | `should_trigger` | At least 3 user prompts that should load the skill. |
 | `should_not_trigger` | At least 3 prompts that should not, chosen to sit close to the line ("fix issue 12" for `issue-create`, "merge PR 7" for `pr-review`). |
+| `must_not_auto_load` | Optional, for a skill with `disable-model-invocation: true` (`dispatch`): plain prompts that must never load it. Its `should_trigger` prompts are then slash-command forms. |
 | `behaviour` | At least 3 tasks, each with an `id`, a seeded `scenario`, a `prompt` and an `expect` list of at least 3 checkable statements. |
 
 `tests/test_skills.py` checks the shape of every eval file, that each scenario exists in the

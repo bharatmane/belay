@@ -1,6 +1,12 @@
 {
   "skill": "dispatch",
+  "notes": "dispatch has disable-model-invocation: true, so it loads only from /belay:dispatch. should_trigger lists slash-command forms; must_not_auto_load lists plain prompts that must never load it. Each behaviour prompt is what the user types after invoking /belay:dispatch (for example `/belay:dispatch resume #12`).",
   "should_trigger": [
+    "/belay:dispatch run belay on the next ready issue",
+    "/belay:dispatch resume #42",
+    "/belay:dispatch pick up the next belay issue"
+  ],
+  "must_not_auto_load": [
     "run belay on the next ready issue",
     "resume the belay run for #42",
     "pick up the next belay issue"

@@ -82,8 +82,9 @@ Exit 3 from any command, or a hook denial naming STOP:
 - No comment and no label change. The hook denies tracker writes under STOP, and the
   switch means a human wants nothing more to happen.
 - Tell the user the switch is on (file or label), that only they clear it by deleting
-  `.belay/STOP` or removing the stop label, and that the run then continues with this skill
-  ("resume the belay run for #<n>").
+  `.belay/STOP` or removing the stop label, and that they then continue the run by typing
+  `/belay:dispatch resume #<n>`. This skill never loads from a plain request, so "resume the
+  run" without the slash command does nothing.
 - Never delete the file, remove the label, or offer to. Do not leave the run `working`.
 
 ## Owner overrides

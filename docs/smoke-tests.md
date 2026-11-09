@@ -75,7 +75,8 @@ Expect: `B status` prints `{"ok": true, "runs": [], "warnings": []}` and exits 0
 
 In a fresh session in `<sandbox>`, try a few prompts from each
 `evals/<skill>.json` file: the `should_trigger` prompts should load the skill, and the
-`should_not_trigger` prompts should not.
+`should_not_trigger` prompts should not. For `dispatch`, `should_trigger` holds slash-command
+forms (`/belay:dispatch ...`) and `must_not_auto_load` holds plain prompts that must not load it.
 
 Expect:
 
@@ -153,13 +154,14 @@ Expect:
   "Belay stop switch is on (...STOP exists): file edits, commits, pushes, merges and
   tracker changes are paused ...".
 - The next `B check-stop` prints
-  `{"ok": false, "code": 3, "reason": "stop switch: .belay/STOP exists; delete it to resume"}`
+  `{"ok": false, "code": 3, "reason": "stop switch: .belay/STOP exists; only the owner clears it"}`
   and exits 3.
 - The skill runs `B wait <run> --reason "stop switch"`, posts no comment, changes no label,
   tells you that you clear the switch, and does not delete `STOP` itself.
 - Adding the `belay:stop` label instead (without the file) makes `check-stop --label belay:stop`
   print `"reason": "stop switch: issue has label 'belay:stop'"`, exit 3.
-- After you delete `STOP` and ask to resume, `B resume <run>` succeeds and work continues.
+- After you delete `STOP` and type `/belay:dispatch resume #<n>`, `B resume <run>` succeeds
+  and work continues.
 
 ## 8. Budget exhausted
 
