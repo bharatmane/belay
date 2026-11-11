@@ -230,6 +230,36 @@ blocked by the permission classifier): that the installed plugin's hook loads an
 honoured, `/hooks` and `/belay:dispatch` appear, the Windows `python3 || python` fallback,
 and the stop-file, budget and no-evidence cases end to end through a real model.
 
+### 2026-11-11: interactive Claude Code session against `bharatmane/belay-sandbox` (public)
+
+Versions: Claude Code 2.1.322, Python 3.14.4, gh 2.101.0, belay `0.1.0-dev` at `main` (8ca925c).
+Run from a real interactive Claude Code session on Windows (`/belay:dispatch`), not from the
+helper alone. Repository checks on the same commit: `validate_repo.py` OK, 287 tests OK,
+`claude plugin validate .` passed with one warning (`ICON_MISSING`, relevant only for the
+plugin directory).
+
+| case | result |
+|---|---|
+| `/belay:dispatch` appears and loads as a skill | pass |
+| empty queue (no `belay:ready` issue): reports it, claims nothing | pass |
+| `find_ready` after the owner added `belay:ready` to issue #3 | pass |
+| claim, `Claimed` comment, label `working`, worktree off `main`, baseline evidence | pass |
+| `check-paths` before editing, tests first (two new tests seen failing), fix, full suite on a clean HEAD, evidence recorded for that SHA | pass |
+| push without force, draft PR #4, `closingIssuesReferences` links #3, `isDraft` true | pass |
+| `hand-off` with evidence for the exact HEAD (exit 0), `Ready for review` comment, label `review` | pass |
+| one issue per run: stopped after hand-off, did not start another | pass |
+| stop file set by the owner in the main checkout after hand-off: `check-stop` exits 3 with the documented reason | pass |
+| hook denies a Write while `.belay/STOP` exists (`hello4.txt`), with the documented message; the model did not work around it | pass |
+| a Write of `hello.txt` made shortly after `.belay/STOP` was created was **allowed** | **open, unexplained**: replaying the same event through `scripts/belay_hook.py` denies it in the worktree and in the main checkout, so the code is correct. The hook fails open on internal errors, which is a possible cause but not confirmed. Needs a reproduction |
+| `echo stop > .belay\STOP` typed in Bash | not a defect: Bash drops the backslash and creates `.belaySTOP`; the helper correctly reported no stop |
+
+Not exercised in this session: stop file set **mid-run**, the stop **label**, budget
+exhaustion (`active_minutes = 1`), hand-off without evidence (exit 7), high-risk path
+(exit 8), `/hooks` listing the plugin hook, and whether the `python3 || python` hook fallback
+runs on a Windows machine without `python3`.
+
+Note: the scratch repository is public; the protocol above suggests a private one.
+
 Each run adds an entry: date, the four versions from [Before you start](#before-you-start),
 one line per case (pass, or what happened instead), and the commit of any fix.
 
