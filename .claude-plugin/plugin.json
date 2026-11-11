@@ -1,6 +1,6 @@
 {
   "name": "belay",
-  "version": "0.1.0",
+  "version": "0.1.1-dev",
   "description": "A safety loop for issue-to-PR work: create issues, dispatch them to agents, and review the resulting pull requests.",
   "author": { "name": "Bharat Mane" },
   "repository": "https://github.com/bharatmane/belay",
