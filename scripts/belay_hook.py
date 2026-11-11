@@ -671,12 +671,17 @@ def find_root(start: str) -> str | None:
     worktree without its own `.belay/` uses its main checkout's footprint (no subprocess)."""
     d = os.path.abspath(start)
     while True:
-        if os.path.isdir(os.path.join(d, ".belay")):
-            return d
         git = os.path.join(d, ".git")
         if os.path.isfile(git):
+            # A linked worktree: the main checkout's footprint wins even when the worktree has a
+            # .belay/ of its own (dispatch keeps body files in <worktree>/.belay/tmp), otherwise
+            # that STOP and those run records would be ignored.
             main = _main_checkout(d)
-            return main if main and os.path.isdir(os.path.join(main, ".belay")) else None
+            if main and os.path.isdir(os.path.join(main, ".belay")):
+                return main
+            return d if os.path.isdir(os.path.join(d, ".belay")) else None
+        if os.path.isdir(os.path.join(d, ".belay")):
+            return d
         if os.path.exists(git):
             return None
         parent = os.path.dirname(d)

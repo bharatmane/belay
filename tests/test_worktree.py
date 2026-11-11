@@ -53,6 +53,15 @@ class WorktreeTests(unittest.TestCase):
         self.assertEqual(Path(h.find_root(str(self.wt / "sub"))), self.main)
         self.assertEqual(Path(h.find_root(str(self.main))), self.main)
 
+    def test_worktree_with_its_own_belay_dir_still_uses_the_main_footprint(self):
+        # dispatch writes body files to <worktree>/.belay/tmp, so the worktree has a .belay/ of its own
+        (self.wt / ".belay" / "tmp").mkdir(parents=True)
+        self.assertEqual(Path(h.find_root(str(self.wt / "sub"))), self.main)
+        (self.main / ".belay" / "STOP").write_text("", encoding="utf-8")
+        reason = self.decision(self.hook("Write", self.wt, file_path=str(self.wt / "hello.txt"),
+                                         content="hi"))
+        self.assertIn("STOP", reason or "")
+
     def test_stop_in_main_denies_edit_in_worktree(self):
         (self.main / ".belay" / "STOP").write_text("", encoding="utf-8")
         reason = self.decision(self.hook("Edit", self.wt / "sub", file_path=str(self.wt / "a.py"),
