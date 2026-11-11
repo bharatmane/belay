@@ -10,7 +10,7 @@ paths need a human's label; and nothing merges, approves, force-pushes or pushes
 base branch. Some of these are enforced by the hook, some only by a helper the skill must
 call, and some are advice: the table below says which.
 
-Status: `0.1.0-dev`, pre-release. GitHub only; a Jira adapter is planned, not yet
+Status: `0.1.0`, first release. GitHub only; a Jira adapter is planned, not yet
 supported.
 
 ## What is enforced, and what is only advice

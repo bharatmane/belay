@@ -5,7 +5,9 @@ release process is in [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Unreleased
 
-First release candidate (`0.1.0-dev`).
+## 0.1.0 - 2026-11-11
+
+First release.
 
 ### Added
 
